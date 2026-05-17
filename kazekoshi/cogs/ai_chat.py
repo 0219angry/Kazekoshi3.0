@@ -93,7 +93,7 @@ class AIChatCog(commands.Cog):
             self.history[user_id] = self.history[user_id][-(MAX_HISTORY * 2):]
         try:
             response = await self.client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-2.0-flash-lite",
                 config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
                 contents=self.history[user_id],
             )
@@ -104,9 +104,12 @@ class AIChatCog(commands.Cog):
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 logger.warning("Gemini API レート制限")
-                return "❌ AIのレート制限に達しました。しばらく待ってから再試行してください。"
+                return "ちょっと待って、今AIが混んでる。少ししたらもう一回試して"
+            if "503" in msg or "UNAVAILABLE" in msg:
+                logger.warning("Gemini API 一時的に利用不可")
+                return "今AIのサーバーが重いみたい。時間おいてから試してみて"
             logger.exception("Gemini API 呼び出しエラー")
-            return "❌ AI応答の取得に失敗しました"
+            return "なんかエラーが出た。もう一回試してみて"
 
 
 async def setup(bot):
