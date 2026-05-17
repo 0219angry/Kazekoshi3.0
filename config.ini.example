@@ -1,0 +1,22 @@
+[DEFAULT]
+# ─── Discord ─────────────────────────────────────────────────────
+DISCORD_TOKEN      = your_discord_bot_token_here
+COMMAND_PREFIX     = !
+
+# ─── VOICEVOX ────────────────────────────────────────────────────
+# デフォルトの話者ID（3 = ずんだもんノーマル）
+SPEAKER_ID         = 3
+OPEN_JTALK_DICT_DIR = open_jtalk_dic_utf_8-1.11
+
+# ─── OpenWeatherMap ──────────────────────────────────────────────
+OPEN_WEATHER_MAP_TOKEN = your_openweathermap_api_key_here
+
+# デフォルト拠点の座標（変更でどこでもOK）
+DEFAULT_LAT  = 35.6895
+DEFAULT_LON  = 139.6917
+DEFAULT_CITY = 東京
+
+# ─── Anthropic (Claude AI) ───────────────────────────────────────
+# /ai コマンドやメンション応答で使用
+# 不要なら空のままにしてください（AI機能が無効になります）
+ANTHROPIC_API_KEY  = your_anthropic_api_key_here
