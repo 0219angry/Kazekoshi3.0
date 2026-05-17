@@ -164,6 +164,13 @@ class MusicCog(commands.Cog):
         embed.add_field(name="リクエスト", value=current["requester"], inline=True)
         await ctx.send(embed=embed)
 
+    # ─── エラーハンドラ ──────────────────────────────────────────
+
+    @play.error
+    async def play_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("曲名かURLを入力してね。例: `!play 夜に駆ける`")
+
     # ─── 内部処理 ────────────────────────────────────────────────
 
     async def _play_next(self, guild: discord.Guild):
