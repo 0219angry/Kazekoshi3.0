@@ -97,9 +97,13 @@ class AIChatCog(commands.Cog):
             reply = response.text
             self.history[user_id].append(types.Content(role="model", parts=[types.Part(text=reply)]))
             return reply
-        except Exception:
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                logger.warning("Gemini API レート制限")
+                return "❌ AIのレート制限に達しました。しばらく待ってから再試行してください。"
             logger.exception("Gemini API 呼び出しエラー")
-            return "AI応答の取得に失敗しました"
+            return "❌ AI応答の取得に失敗しました"
 
 
 async def setup(bot):
