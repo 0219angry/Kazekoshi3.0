@@ -3,7 +3,6 @@ import configparser
 from logging import getLogger
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 logger = getLogger(__name__)
@@ -26,10 +25,10 @@ MAX_HISTORY = 20
 
 
 class AIChatCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
         self.client = None
-        self.history: dict[int, list] = {}
+        self.history = {}
 
         if not GENAI_AVAILABLE:
             return
@@ -46,47 +45,33 @@ class AIChatCog(commands.Cog):
         except Exception:
             logger.exception("GEMINI_API_KEY の読み込みに失敗しました（AI機能は無効）")
 
-    # ─── スラッシュコマンド ───────────────────────────────────────
-
-    @app_commands.command(name="ai", description="AIと会話します")
-    @app_commands.describe(message="AIへのメッセージ")
-    async def ai(self, interaction: discord.Interaction, message: str):
+    @commands.command(name="ai")
+    async def ai(self, ctx, *, message: str):
         if not self._available():
-            await interaction.response.send_message("❌ AI機能は現在設定されていません", ephemeral=True)
+            await ctx.send("❌ AI機能は現在設定されていません")
             return
-
-        await interaction.response.defer()
-        reply = await self._chat(interaction.user.id, message)
-
+        async with ctx.typing():
+            reply = await self._chat(ctx.author.id, message)
         embed = discord.Embed(description=reply, color=discord.Color.purple())
-        embed.set_author(
-            name="🤖 Kazekoshi AI",
-            icon_url=self.bot.user.display_avatar.url,
-        )
+        embed.set_author(name="🤖 Kazekoshi AI", icon_url=self.bot.user.display_avatar.url)
         embed.set_footer(text=f"質問: {message[:60]}{'…' if len(message) > 60 else ''}")
-        await interaction.followup.send(embed=embed)
-        logger.info(f"{interaction.user} /ai: {message[:50]}")
+        await ctx.send(embed=embed)
+        logger.info(f"{ctx.author} !ai: {message[:50]}")
 
-    @app_commands.command(name="ai_reset", description="AIとの会話履歴をリセットします")
-    async def ai_reset(self, interaction: discord.Interaction):
-        self.history.pop(interaction.user.id, None)
-        await interaction.response.send_message("🔄 会話履歴をリセットしました", ephemeral=True)
-
-    # ─── メンションで会話 ────────────────────────────────────────
+    @commands.command(name="ai_reset")
+    async def ai_reset(self, ctx):
+        self.history.pop(ctx.author.id, None)
+        await ctx.send("🔄 会話履歴をリセットしました")
 
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
-        if not self._available():
+    async def on_message(self, message):
+        if message.author.bot or not self._available():
             return
         if self.bot.user not in message.mentions:
             return
-
         content = message.content.replace(f"<@{self.bot.user.id}>", "").strip()
         if not content:
             return
-
         async with message.channel.typing():
             reply = await self._chat(message.author.id, content)
             if len(reply) > 1900:
@@ -94,22 +79,15 @@ class AIChatCog(commands.Cog):
             await message.reply(reply)
         logger.info(f"{message.author} mention AI: {content[:50]}")
 
-    # ─── 内部処理 ────────────────────────────────────────────────
-
-    def _available(self) -> bool:
+    def _available(self):
         return self.client is not None
 
-    async def _chat(self, user_id: int, message: str) -> str:
+    async def _chat(self, user_id, message):
         if user_id not in self.history:
             self.history[user_id] = []
-
-        self.history[user_id].append(
-            types.Content(role="user", parts=[types.Part(text=message)])
-        )
-
+        self.history[user_id].append(types.Content(role="user", parts=[types.Part(text=message)]))
         if len(self.history[user_id]) > MAX_HISTORY * 2:
             self.history[user_id] = self.history[user_id][-(MAX_HISTORY * 2):]
-
         try:
             response = await self.client.aio.models.generate_content(
                 model="gemini-2.0-flash",
@@ -117,14 +95,12 @@ class AIChatCog(commands.Cog):
                 contents=self.history[user_id],
             )
             reply = response.text
-            self.history[user_id].append(
-                types.Content(role="model", parts=[types.Part(text=reply)])
-            )
+            self.history[user_id].append(types.Content(role="model", parts=[types.Part(text=reply)]))
             return reply
         except Exception:
             logger.exception("Gemini API 呼び出しエラー")
             return "AI応答の取得に失敗しました"
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot):
     await bot.add_cog(AIChatCog(bot))

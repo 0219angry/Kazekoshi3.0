@@ -10,17 +10,14 @@ from discord.ext import commands
 
 MAX_LOG_FILE = 5
 
-# ディレクトリ作成
 for directory in ["log", "temp", "json"]:
     os.makedirs(directory, exist_ok=True)
 
-# 古いログ削除
 loglist = sorted(glob.glob("./log/*.log"))
 if len(loglist) > MAX_LOG_FILE:
     for old_log in loglist[:-MAX_LOG_FILE]:
         os.remove(old_log)
 
-# ロギング設定
 log_format = "[%(asctime)s] %(name)s:%(lineno)s %(funcName)s [%(levelname)s]: %(message)s"
 sh = StreamHandler()
 sh.setLevel(INFO)
@@ -31,7 +28,6 @@ fh.setFormatter(Formatter(log_format))
 basicConfig(level=NOTSET, handlers=[sh, fh])
 logger = getLogger(__name__)
 
-# config.ini 読み込み
 try:
     config = configparser.ConfigParser()
     config.read("config.ini", encoding="UTF-8")
@@ -63,15 +59,9 @@ class KazekoshiBot(commands.Bot):
             except Exception:
                 logger.exception(f"Cog の読み込みに失敗しました: {cog}")
 
-        try:
-            synced = await self.tree.sync()
-            logger.info(f"スラッシュコマンドを {len(synced)} 件同期しました")
-        except Exception:
-            logger.exception("スラッシュコマンドの同期に失敗しました")
-
     async def on_ready(self):
         logger.info(f"Kazekoshi v3.0 on ready (discord.py v{discord.__version__})")
-        await self.change_presence(activity=discord.Game(name="Kazekoshi v3.0 | /help"))
+        await self.change_presence(activity=discord.Game(name=f"Kazekoshi v3.0 | {COMMAND_PREFIX}help"))
 
 
 intents = discord.Intents.all()

@@ -7,12 +7,11 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-TOTAL=4
+TOTAL=5
 step() { echo -e "\n${YELLOW}[${1}/${TOTAL}] ${2}${NC}"; }
 ok()   { echo -e "${GREEN}✓ ${1}${NC}"; }
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
-
 echo -e "${BOLD}=== Kazekoshi v3.0 セットアップ ===${NC}"
 
 # ─── 1. ffmpeg ──────────────────────────────────────────────────────
@@ -20,7 +19,7 @@ step 1 "ffmpeg のインストール"
 if command -v ffmpeg &>/dev/null; then
     ok "ffmpeg は既にインストール済み"
 else
-    sudo apt-get update -qq && sudo apt-get install -y ffmpeg wget
+    sudo apt-get update -qq && sudo apt-get install -y ffmpeg wget unzip
     ok "ffmpeg をインストールしました"
 fi
 
@@ -35,34 +34,66 @@ fi
 venv/bin/pip install -q --upgrade pip
 venv/bin/pip install -r requirements.txt
 
-# voicevox-core は PyPI に存在しないため GitHub releases のアセット一覧から URL を取得する
 ARCH=$(uname -m)
 PY_VER=$(venv/bin/python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
-echo "  アーキテクチャ: ${ARCH} / Python cp${PY_VER} → voicevox-coreのURLを検索中..."
-WHEEL_URL=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" \
-    | python3 -c "
+echo "  アーキテクチャ: ${ARCH} → voicevox-core を検索中..."
+RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest")
+LATEST=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+WHEEL_URL=$(echo "$RELEASE_JSON" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 arch = '${ARCH}'
-urls = [
-    a['browser_download_url'] for a in data['assets']
-    if arch in a['name'] and 'manylinux' in a['name'] and a['name'].endswith('.whl')
-]
+urls = [a['browser_download_url'] for a in data['assets']
+        if arch in a['name'] and 'manylinux' in a['name'] and a['name'].endswith('.whl')]
 print(urls[0] if urls else '')
 ")
 if [ -z "$WHEEL_URL" ]; then
-    echo "❌ voicevox-core の対応ホイールが見つかりませんでした"
-    echo "   https://github.com/VOICEVOX/voicevox_core/releases から手動でインストールしてください"
-    exit 1
+    echo "❌ voicevox-core の対応ホイールが見つかりませんでした"; exit 1
 fi
-echo "  → $WHEEL_URL"
 venv/bin/pip install -q "$WHEEL_URL"
 ok "Pythonパッケージをインストールしました"
 
-# ─── 3. Open JTalk辞書 ──────────────────────────────────────────────
-step 3 "Open JTalk辞書のダウンロード"
-DICT_DIR="open_jtalk_dic_utf_8-1.11"
-if [ -d "$DICT_DIR" ]; then
+# ─── 3. VOICEVOXダウンローダー & ランタイム & 音声モデル ────────────
+step 3 "VOICEVOXランタイム & 音声モデルのダウンロード"
+mkdir -p lib models
+case "$ARCH" in
+    x86_64)  DL_BIN="download-linux-x64" ;;
+    aarch64) DL_BIN="download-linux-arm64" ;;
+    *) echo "❌ 未対応アーキテクチャ: $ARCH"; exit 1 ;;
+esac
+
+# ダウンローダーバイナリを取得
+if [ ! -f "$DL_BIN" ]; then
+    wget -q "https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${DL_BIN}"
+    chmod +x "$DL_BIN"
+fi
+
+# ONNXランタイム（利用規約: 非商用・商用OK、クレジット表記必要）
+LIB_FILE=$(venv/bin/python -c "from voicevox_core.blocking import Onnxruntime; print(Onnxruntime.LIB_VERSIONED_FILENAME)")
+if ls lib/*.so* &>/dev/null 2>&1; then
+    ok "ONNXランタイムは既に存在します"
+else
+    echo "  ONNXランタイムをダウンロード中..."
+    echo "y" | ./"$DL_BIN" --only onnxruntime -o voicevox_dl_tmp 2>&1 | grep -v "^\[" || true
+    find voicevox_dl_tmp/ -name "*.so*" -exec cp {} lib/ \;
+    rm -rf voicevox_dl_tmp
+    ok "ONNXランタイムをインストールしました"
+fi
+
+# 音声モデル（利用規約: キャラクターごとに確認が必要）
+if ls models/*.vvm &>/dev/null 2>&1; then
+    ok "音声モデルが存在します: $(ls models/*.vvm | wc -l) 件"
+else
+    echo "  音声モデルをダウンロード中（数百MB・時間がかかります）..."
+    echo "y" | ./"$DL_BIN" --only models -o voicevox_dl_tmp 2>&1 | grep -v "^\[" || true
+    find voicevox_dl_tmp/ -name "*.vvm" -exec cp {} models/ \;
+    rm -rf voicevox_dl_tmp
+    ok "音声モデルをダウンロードしました: $(ls models/*.vvm | wc -l) 件"
+fi
+
+# ─── 4. Open JTalk辞書 ──────────────────────────────────────────────
+step 4 "Open JTalk辞書のダウンロード"
+if [ -d "open_jtalk_dic_utf_8-1.11" ]; then
     ok "辞書は既に存在します"
 else
     wget --show-progress -q \
@@ -72,29 +103,32 @@ else
     ok "辞書をダウンロードしました"
 fi
 
-# ─── 4. config.ini ──────────────────────────────────────────────────
-step 4 "設定ファイルの作成"
+# ─── 5. config.ini ──────────────────────────────────────────────────
+step 5 "設定ファイルの作成"
 if [ -f "config.ini" ]; then
     ok "config.ini は既に存在します（スキップ）"
 else
     cp config.ini.example config.ini
-
-    echo -e "\n${BLUE}APIキーを入力してください（Enterでスキップして後でconfig.iniを編集することも可）${NC}"
-    echo ""
-
+    echo -e "\n${BLUE}APIキーを入力してください（Enterでスキップ・後でconfig.iniを直接編集も可）${NC}\n"
     read -rp "  Discord Bot Token（必須）: " discord_token
     read -rp "  OpenWeatherMap API Key  : " owm_token
     read -rp "  Gemini API Key          : " gemini_key
-
-    # | をデリミタにして / を含むトークンでも安全に置換
     [ -n "$discord_token" ] && sed -i "s|your_discord_bot_token_here|${discord_token}|g" config.ini
     [ -n "$owm_token" ]     && sed -i "s|your_openweathermap_api_key_here|${owm_token}|g" config.ini
     [ -n "$gemini_key" ]    && sed -i "s|your_gemini_api_key_here|${gemini_key}|g" config.ini
-
     ok "config.ini を作成しました"
 fi
+
+# ─── run.sh ─────────────────────────────────────────────────────────
+cat > run.sh << 'EOF'
+#!/bin/bash
+cd "$(dirname "${BASH_SOURCE[0]}")"
+export LD_LIBRARY_PATH="$PWD/lib:${LD_LIBRARY_PATH:-}"
+exec venv/bin/python Kazekoshi.py "$@"
+EOF
+chmod +x run.sh
 
 # ─── 完了 ───────────────────────────────────────────────────────────
 echo -e "\n${GREEN}${BOLD}=== セットアップ完了！ ===${NC}"
 echo -e "\n起動コマンド:"
-echo -e "  ${BOLD}source venv/bin/activate && python Kazekoshi.py${NC}\n"
+echo -e "  ${BOLD}bash run.sh${NC}\n"

@@ -6,3 +6,9 @@
 /kazekoshi/__pycache__/
 /kazekoshi/cogs/__pycache__/
 *.pyc
+models/*.vvm
+lib/
+download-linux-*
+run.sh
+venv/
+open_jtalk_dic_utf_8-1.11/
