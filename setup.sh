@@ -44,10 +44,9 @@ WHEEL_URL=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/rele
 import sys, json
 data = json.load(sys.stdin)
 arch = '${ARCH}'
-pyver = 'cp${PY_VER}'
 urls = [
     a['browser_download_url'] for a in data['assets']
-    if arch in a['name'] and pyver in a['name'] and 'cpu' in a['name'] and a['name'].endswith('.whl')
+    if arch in a['name'] and 'manylinux' in a['name'] and a['name'].endswith('.whl')
 ]
 print(urls[0] if urls else '')
 ")
