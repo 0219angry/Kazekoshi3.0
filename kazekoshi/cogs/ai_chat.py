@@ -90,7 +90,7 @@ class AIChatCog(commands.Cog):
             self.history[user_id] = self.history[user_id][-(MAX_HISTORY * 2):]
         try:
             response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-lite",
                 config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
                 contents=self.history[user_id],
             )
