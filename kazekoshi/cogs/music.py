@@ -54,6 +54,7 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self.queues: dict[int, deque] = defaultdict(deque)
         self.current: dict[int, dict] = {}
+        self.text_channels: dict[int, discord.TextChannel] = {}
 
     # ─── コマンド ────────────────────────────────────────────────
 
@@ -67,6 +68,7 @@ class MusicCog(commands.Cog):
             await ctx.author.voice.channel.connect()
         elif ctx.guild.voice_client.channel != ctx.author.voice.channel:
             await ctx.guild.voice_client.move_to(ctx.author.voice.channel)
+        self.text_channels[ctx.guild.id] = ctx.channel
 
         async with ctx.typing():
             track = await fetch_track(query)
@@ -196,7 +198,7 @@ class MusicCog(commands.Cog):
 
         vc.play(source, after=after)
 
-        channel = guild.text_channels[0]
+        channel = self.text_channels.get(guild.id) or guild.text_channels[0]
         embed = discord.Embed(
             title="🎵 再生開始",
             description=f"[{track['title']}]({track['webpage_url']})",
