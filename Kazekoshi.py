@@ -47,6 +47,8 @@ COGS = [
     "kazekoshi.cogs.poll",
     "kazekoshi.cogs.reminder",
     "kazekoshi.cogs.utility",
+    "kazekoshi.cogs.music",
+    "kazekoshi.cogs.games",
 ]
 
 
