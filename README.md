@@ -19,30 +19,43 @@ cp config.ini.example config.ini
 python Kazekoshi.py
 ```
 
-## AWS EC2 デプロイ（無料枠）
+## Oracle Cloud Free Tier デプロイ（永久無料）
 
-> **注意**: AWS Free Tierは新規アカウントから**12ヶ月のみ**無料。  
-> t2.micro（1 vCPU / 1GB RAM）が対象インスタンス。
+> Oracle Cloud の **Always Free** プランは期間制限なしで永久に無料。  
+> ARM Ampere A1インスタンス（4コア/24GB RAM）が使えるためVOICEVOXも余裕で動く。  
+> 登録にクレジットカードが必要だが、Free Tierの範囲では課金されない。
 
-### 1. EC2インスタンスを起動
+### 1. アカウント作成とインスタンス起動
 
-1. AWSコンソール → EC2 → 「インスタンスを起動」
-2. AMI: **Ubuntu 22.04 LTS**
-3. インスタンスタイプ: **t2.micro**（無料枠対象）
-4. セキュリティグループ: SSH（ポート22）のみ許可
-5. キーペアを作成してダウンロード
+1. [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) でアカウント登録
+2. コンソール → **コンピュート** → **インスタンスの作成**
+3. 以下の設定にする:
+   - イメージ: **Ubuntu 22.04**
+   - シェイプ: **Ampere A1**（`VM.Standard.A1.Flex`）
+   - OCPU: 4、メモリ: 24GB（Always Free枠の上限）
+4. SSHキーを作成してダウンロード
+5. インスタンスを作成
 
-### 2. サーバーにSSH接続
+### 2. ポート開放（ファイアウォール）
+
+Oracleはデフォルトでほぼ全ポートが閉じている。SSH以外は不要なので追加変更なし。
+
+```bash
+# インスタンス内のufwも無効化されているが、念のり確認
+# 基本的にそのままでOK
+```
+
+### 3. SSHで接続
 
 ```bash
 chmod 400 your-key.pem
-ssh -i your-key.pem ubuntu@<EC2のパブリックIP>
+ssh -i your-key.pem ubuntu@<インスタンスのパブリックIP>
 ```
 
-### 3. 環境セットアップ
+### 4. 環境セットアップ
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv ffmpeg git
+sudo apt update && sudo apt install -y python3-pip python3-venv ffmpeg git wget
 
 git clone https://github.com/0219angry/Kazekoshi3.0.git
 cd Kazekoshi3.0
@@ -52,28 +65,27 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. VOICEVOX辞書のインストール
+### 5. VOICEVOX辞書のインストール
 
 ```bash
-# Open JTalk辞書をダウンロード
 wget https://github.com/r9y9/open_jtalk/releases/download/v1.11.1/open_jtalk_dic_utf_8-1.11.tar.gz
 tar xzf open_jtalk_dic_utf_8-1.11.tar.gz
 ```
 
-### 5. config.ini を作成
+### 6. config.ini を作成
 
 ```bash
 cp config.ini.example config.ini
-nano config.ini   # 各APIキーを入力
+nano config.ini   # 各APIキーを入力して Ctrl+O → Enter → Ctrl+X で保存
 ```
 
-### 6. systemdで常時起動設定
+### 7. systemdで常時起動設定
 
 ```bash
 sudo nano /etc/systemd/system/kazekoshi.service
 ```
 
-以下を貼り付け（パスを環境に合わせて変更）:
+以下を貼り付け:
 
 ```ini
 [Unit]
@@ -96,16 +108,19 @@ sudo systemctl daemon-reload
 sudo systemctl enable kazekoshi
 sudo systemctl start kazekoshi
 
-# ログ確認
+# 動作確認
 sudo systemctl status kazekoshi
+
+# ログをリアルタイムで見る
 journalctl -u kazekoshi -f
 ```
 
-## コスト試算（AWS）
+## コスト
 
-| 期間 | 費用 |
+| 項目 | 費用 |
 |---|---|
-| 最初の12ヶ月 | **$0**（Free Tier） |
-| 12ヶ月以降 | 約 $8〜10/月（t2.micro オンデマンド） |
-
-12ヶ月以降も無料で使い続けたい場合は **Oracle Cloud Free Tier**（ARM VM 4コア/24GB、期間無制限）への移行を推奨。
+| Oracle Cloud VM（ARM 4コア/24GB） | **$0（永久無料）** |
+| Discord Bot Token | $0 |
+| OpenWeatherMap | $0（月100万回まで） |
+| Gemini API | $0（1日1500回まで） |
+| **合計** | **$0** |
