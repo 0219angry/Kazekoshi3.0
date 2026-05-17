@@ -16,7 +16,8 @@ DEFAULT_LAT  = 35.6895
 DEFAULT_LON  = 139.6917
 DEFAULT_CITY = 東京
 
-# ─── Anthropic (Claude AI) ───────────────────────────────────────
-# /ai コマンドやメンション応答で使用
+# ─── Google Gemini AI ────────────────────────────────────────────
+# /ai コマンドやメンション応答で使用（無料枠: 1500 req/day, 15 RPM）
+# https://aistudio.google.com/apikey でAPIキーを取得
 # 不要なら空のままにしてください（AI機能が無効になります）
-ANTHROPIC_API_KEY  = your_anthropic_api_key_here
+GEMINI_API_KEY     = your_gemini_api_key_here

@@ -9,11 +9,12 @@ from discord.ext import commands
 logger = getLogger(__name__)
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    from google import genai
+    from google.genai import types
+    GENAI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    logger.warning("anthropic パッケージが見つかりません。AI機能は無効です。")
+    GENAI_AVAILABLE = False
+    logger.warning("google-genai パッケージが見つかりません。AI機能は無効です。")
 
 SYSTEM_PROMPT = (
     "あなたはDiscordサーバーのフレンドリーなアシスタントです。"
@@ -21,26 +22,29 @@ SYSTEM_PROMPT = (
     "Markdownの装飾は最低限に留め、Discord上で読みやすい形式にしてください。"
 )
 
-MAX_HISTORY = 20  # 会話履歴の最大ターン数（user + assistant のペア数）
+MAX_HISTORY = 20
 
 
 class AIChatCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.client = None
-        self.history: dict[int, list[dict]] = {}
+        self.history: dict[int, list] = {}
 
-        if not ANTHROPIC_AVAILABLE:
+        if not GENAI_AVAILABLE:
             return
 
         try:
             config = configparser.ConfigParser()
             config.read("config.ini", encoding="UTF-8")
-            api_key = config["DEFAULT"]["ANTHROPIC_API_KEY"]
-            self.client = anthropic.Anthropic(api_key=api_key)
-            logger.info("Anthropic APIクライアントを初期化しました")
+            api_key = config["DEFAULT"].get("GEMINI_API_KEY", "")
+            if not api_key or api_key == "your_gemini_api_key_here":
+                logger.warning("GEMINI_API_KEY が未設定です（AI機能は無効）")
+                return
+            self.client = genai.Client(api_key=api_key)
+            logger.info("Gemini APIクライアントを初期化しました")
         except Exception:
-            logger.exception("ANTHROPIC_API_KEY の読み込みに失敗しました（AI機能は無効）")
+            logger.exception("GEMINI_API_KEY の読み込みに失敗しました（AI機能は無効）")
 
     # ─── スラッシュコマンド ───────────────────────────────────────
 
@@ -85,7 +89,6 @@ class AIChatCog(commands.Cog):
 
         async with message.channel.typing():
             reply = await self._chat(message.author.id, content)
-            # メンション返信は2000字制限を考慮してカット
             if len(reply) > 1900:
                 reply = reply[:1900] + "\n…（省略）"
             await message.reply(reply)
@@ -100,24 +103,26 @@ class AIChatCog(commands.Cog):
         if user_id not in self.history:
             self.history[user_id] = []
 
-        self.history[user_id].append({"role": "user", "content": message})
+        self.history[user_id].append(
+            types.Content(role="user", parts=[types.Part(text=message)])
+        )
 
-        # 古い履歴をトリミング
         if len(self.history[user_id]) > MAX_HISTORY * 2:
             self.history[user_id] = self.history[user_id][-(MAX_HISTORY * 2):]
 
         try:
-            response = self.client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=1000,
-                system=SYSTEM_PROMPT,
-                messages=self.history[user_id],
+            response = await self.client.aio.models.generate_content(
+                model="gemini-2.0-flash",
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                contents=self.history[user_id],
             )
-            reply = response.content[0].text
-            self.history[user_id].append({"role": "assistant", "content": reply})
+            reply = response.text
+            self.history[user_id].append(
+                types.Content(role="model", parts=[types.Part(text=reply)])
+            )
             return reply
         except Exception:
-            logger.exception("Anthropic API 呼び出しエラー")
+            logger.exception("Gemini API 呼び出しエラー")
             return "AI応答の取得に失敗しました"
 
 

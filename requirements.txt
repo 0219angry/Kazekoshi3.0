@@ -1,4 +1,4 @@
 discord.py>=2.3.0
 voicevox-core
 requests
-anthropic
+google-genai
