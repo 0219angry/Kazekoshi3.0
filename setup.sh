@@ -34,6 +34,20 @@ else
 fi
 venv/bin/pip install -q --upgrade pip
 venv/bin/pip install -r requirements.txt
+
+# voicevox-core はアーキテクチャごとにインストール方法が異なる
+ARCH=$(uname -m)
+PY_VER=$(venv/bin/python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
+if [ "$ARCH" = "aarch64" ]; then
+    echo "  ARM64を検出: GitHubからvoicevox-coreを取得します..."
+    LATEST=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+    WHEEL="voicevox_core-${LATEST}+cpu-cp${PY_VER}-cp${PY_VER}-linux_aarch64.whl"
+    venv/bin/pip install -q \
+        "https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${WHEEL}"
+else
+    venv/bin/pip install -q voicevox-core
+fi
 ok "Pythonパッケージをインストールしました"
 
 # ─── 3. Open JTalk辞書 ──────────────────────────────────────────────
