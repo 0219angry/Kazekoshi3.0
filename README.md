@@ -10,13 +10,18 @@ Discord読み上げBot。VOICEVOX + Gemini AI搭載。
 | OpenWeatherMap | 天気機能 | [openweathermap.org](https://openweathermap.org/api) |
 | Google Gemini API | AI会話 | [Google AI Studio](https://aistudio.google.com/apikey) |
 
-## ローカル起動
+## セットアップ（ローカル・サーバー共通）
+
+`setup.sh` が ffmpeg・仮想環境・パッケージ・辞書・config.ini の作成をすべて自動で行います。
 
 ```bash
-pip install -r requirements.txt
-cp config.ini.example config.ini
-# config.ini を編集して各APIキーを設定
-python Kazekoshi.py
+bash setup.sh
+```
+
+実行後は以下で起動:
+
+```bash
+source venv/bin/activate && python Kazekoshi.py
 ```
 
 ## Oracle Cloud Free Tier デプロイ（永久無料）
@@ -36,50 +41,23 @@ python Kazekoshi.py
 4. SSHキーを作成してダウンロード
 5. インスタンスを作成
 
-### 2. ポート開放（ファイアウォール）
-
-Oracleはデフォルトでほぼ全ポートが閉じている。SSH以外は不要なので追加変更なし。
-
-```bash
-# インスタンス内のufwも無効化されているが、念のり確認
-# 基本的にそのままでOK
-```
-
-### 3. SSHで接続
+### 2. SSHで接続
 
 ```bash
 chmod 400 your-key.pem
 ssh -i your-key.pem ubuntu@<インスタンスのパブリックIP>
 ```
 
-### 4. 環境セットアップ
+### 3. リポジトリのクローンとセットアップ
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv ffmpeg git wget
-
+sudo apt install -y git python3-venv
 git clone https://github.com/0219angry/Kazekoshi3.0.git
 cd Kazekoshi3.0
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+bash setup.sh
 ```
 
-### 5. VOICEVOX辞書のインストール
-
-```bash
-wget https://github.com/r9y9/open_jtalk/releases/download/v1.11.1/open_jtalk_dic_utf_8-1.11.tar.gz
-tar xzf open_jtalk_dic_utf_8-1.11.tar.gz
-```
-
-### 6. config.ini を作成
-
-```bash
-cp config.ini.example config.ini
-nano config.ini   # 各APIキーを入力して Ctrl+O → Enter → Ctrl+X で保存
-```
-
-### 7. systemdで常時起動設定
+### 4. systemdで常時起動設定
 
 ```bash
 sudo nano /etc/systemd/system/kazekoshi.service
