@@ -9,6 +9,159 @@ logger = getLogger(__name__)
 SHUKATSU_KANJI = re.compile(r".*就.*活.*")
 SHUKATSU_KANA = re.compile(r".*し.*ゅ.*う.*か.*つ.*")
 
+# ─── ヘルプUI ────────────────────────────────────────────────────
+
+HELP_SECTIONS = {
+    "home": {
+        "label": "🏠 ホーム",
+        "color": 0x5865F2,
+        "description": None,
+    },
+    "voice": {
+        "label": "🎤 読み上げ",
+        "color": 0x57F287,
+        "cmds": [
+            ("{p}join",          "VCに接続して読み上げを開始"),
+            ("{p}leave",         "VCから切断・読み上げ終了"),
+            ("{p}voice",         "自分の読み上げボイスをプルダウンで変更"),
+        ],
+    },
+    "music": {
+        "label": "🎵 音楽再生",
+        "color": 0xFEE75C,
+        "cmds": [
+            ("{p}play [曲名/URL]", "YouTube から再生（キューに追加）"),
+            ("{p}skip",           "今の曲をスキップ"),
+            ("{p}stop",           "停止してVC切断"),
+            ("{p}pause",          "一時停止"),
+            ("{p}resume",         "再開"),
+            ("{p}queue",          "再生キューを表示"),
+            ("{p}np",             "再生中の曲を表示"),
+        ],
+    },
+    "games": {
+        "label": "🎮 ゲーム",
+        "color": 0xED4245,
+        "cmds": [
+            ("{p}janken グー",     "じゃんけん（グー / チョキ / パー）"),
+            ("{p}omikuji",        "おみくじ（大吉〜大凶）"),
+            ("{p}slot",           "スロット"),
+            ("{p}8ball [質問]",   "8ボール占い"),
+            ("{p}dice [表記]",    "ダイスロール（例: 2d6）"),
+            ("{p}coin",           "コイントス"),
+            ("{p}choose [選択肢]","カンマ区切りからランダムに1つ選ぶ"),
+        ],
+    },
+    "notify": {
+        "label": "🔔 通知・リマインダー",
+        "color": 0xEB459E,
+        "cmds": [
+            ("{p}notify",         "接続中VCへの入室通知を設定"),
+            ("{p}notify_remove",  "入室通知を解除"),
+            ("{p}notify_list",    "通知設定一覧を表示"),
+            ("{p}remind [時間] [内容]", "指定時間後にリマインド（例: 10m / 2h / 1d）"),
+        ],
+    },
+    "weather": {
+        "label": "🌤️ 天気",
+        "color": 0x5DADE2,
+        "cmds": [
+            ("{p}weather [都市名]", "天気情報を表示（省略でデフォルト拠点）"),
+            ("あつい / さむい",     "気温に合わせてBotがリアクション"),
+        ],
+    },
+    "dict": {
+        "label": "📖 辞書・AI",
+        "color": 0x9B59B6,
+        "cmds": [
+            ("{p}dict_add [単語] [読み]", "読み上げ辞書に単語を追加"),
+            ("{p}dict_del [単語]",        "辞書から削除"),
+            ("{p}dict_list",              "辞書一覧を表示"),
+            ("{p}ai [メッセージ]",        "AIと会話（履歴あり）"),
+            ("{p}ai_reset",               "会話履歴をリセット"),
+            ("@Botをメンション",           "メンションでAIに話しかける"),
+        ],
+    },
+    "util": {
+        "label": "🛠️ ユーティリティ",
+        "color": 0x95A5A6,
+        "cmds": [
+            ("{p}poll [質問] [選択肢]", "投票を作成（最大10択）"),
+            ("{p}quickpoll [質問]",     "👍 / 👎 の簡易投票"),
+            ("{p}userinfo [メンバー]",  "ユーザー情報を表示"),
+            ("{p}serverinfo",           "サーバー情報を表示"),
+            ("{p}avatar [メンバー]",    "アバターを表示"),
+            ("{p}ping",                 "Botのレイテンシを確認"),
+        ],
+    },
+}
+
+
+def build_home_embed(p: str, bot: discord.Client) -> discord.Embed:
+    embed = discord.Embed(
+        title="風越Bot — コマンド一覧",
+        description=(
+            "カテゴリをセレクトメニューから選ぶと詳細が見られるよ\n\n"
+            f"**🎤 読み上げ** — VOICEVOX音声合成\n"
+            f"**🎵 音楽再生** — YouTube再生\n"
+            f"**🎮 ゲーム** — じゃんけん・スロットなど\n"
+            f"**🔔 通知・リマインダー** — VC入室通知・時間指定通知\n"
+            f"**🌤️ 天気** — 気温・天気情報\n"
+            f"**📖 辞書・AI** — 読み上げ辞書・Gemini AI\n"
+            f"**🛠️ ユーティリティ** — 投票・ユーザー情報など"
+        ),
+        color=0x5865F2,
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text=f"プレフィックス: {p}  |  就活の話はしないでください😡")
+    return embed
+
+
+def build_category_embed(key: str, p: str) -> discord.Embed:
+    section = HELP_SECTIONS[key]
+    cmds = section["cmds"]
+    lines = "\n".join(
+        f"`{cmd.replace('{p}', p)}` — {desc}" for cmd, desc in cmds
+    )
+    embed = discord.Embed(
+        title=section["label"],
+        description=lines,
+        color=section["color"],
+    )
+    embed.set_footer(text=f"プレフィックス: {p}  |  就活の話はしないでください😡")
+    return embed
+
+
+def build_help_embed(p: str, bot: discord.Client):
+    embed = build_home_embed(p, bot)
+    view = HelpView(p, bot)
+    return embed, view
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, p: str, bot: discord.Client):
+        self.p = p
+        self.bot = bot
+        options = [discord.SelectOption(label="🏠 ホーム", value="home")] + [
+            discord.SelectOption(label=v["label"], value=k)
+            for k, v in HELP_SECTIONS.items() if k != "home"
+        ]
+        super().__init__(placeholder="カテゴリを選んでね", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        key = self.values[0]
+        if key == "home":
+            embed = build_home_embed(self.p, self.bot)
+        else:
+            embed = build_category_embed(key, self.p)
+        await interaction.response.edit_message(embed=embed)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, p: str, bot: discord.Client):
+        super().__init__(timeout=120)
+        self.add_item(HelpSelect(p, bot))
+
 
 class UtilityCog(commands.Cog):
     def __init__(self, bot):
@@ -72,56 +225,8 @@ class UtilityCog(commands.Cog):
     @commands.command(name="help")
     async def help(self, ctx):
         p = self.bot.command_prefix
-        embed = discord.Embed(title="📋 Kazekoshi v3.0 コマンド一覧", color=discord.Color.blue())
-        sections = {
-            "🎤 読み上げ": [
-                (f"{p}join", "VCに接続して読み上げ開始"),
-                (f"{p}leave", "VCから切断・終了"),
-                (f"{p}voice", "自分の読み上げボイスを変更"),
-            ],
-            "🎲 ダイス・ゲーム": [
-                (f"{p}dice [表記]", "ダイスを振る（例: `2d6`）"),
-                (f"{p}coin", "コインを投げる"),
-                (f"{p}choose [選択肢]", "選択肢からランダムに1つ選ぶ"),
-            ],
-            "🔔 通知": [
-                (f"{p}notify", "現在接続中VCの入室通知を設定"),
-                (f"{p}notify_remove", "入室通知を解除"),
-                (f"{p}notify_list", "通知設定一覧を表示"),
-            ],
-            "🌤️ 天気": [
-                (f"{p}weather [都市名]", "天気情報を表示"),
-                ("あつい / さむい など", "気温に合わせてリアクション"),
-            ],
-            "📖 辞書": [
-                (f"{p}dict_add [単語] [読み]", "辞書に単語を追加"),
-                (f"{p}dict_del [単語]", "辞書から単語を削除"),
-                (f"{p}dict_list", "辞書の内容を一覧表示"),
-            ],
-            "🤖 AI": [
-                (f"{p}ai [メッセージ]", "AIと会話（会話履歴あり）"),
-                (f"{p}ai_reset", "AIの会話履歴をリセット"),
-                ("@Botをメンション", "メンションでAIに直接話しかける"),
-            ],
-            "📊 投票": [
-                (f"{p}poll [質問] [選択肢]", "投票を作成（最大10択）"),
-                (f"{p}quickpoll [質問]", "👍 / 👎 の簡易投票"),
-            ],
-            "⏰ リマインダー": [
-                (f"{p}remind [時間] [内容]", "指定時間後にリマインド"),
-            ],
-            "🛠️ ユーティリティ": [
-                (f"{p}userinfo [メンバー]", "ユーザー情報を表示"),
-                (f"{p}serverinfo", "サーバー情報を表示"),
-                (f"{p}avatar [メンバー]", "アバターを表示"),
-                (f"{p}ping", "Botのレイテンシを確認"),
-            ],
-        }
-        for section, cmds in sections.items():
-            value = "\n".join(f"`{cmd}` — {desc}" for cmd, desc in cmds)
-            embed.add_field(name=section, value=value, inline=False)
-        embed.set_footer(text="Kazekoshi v3.0 | 就活の話はしないでください😡")
-        await ctx.send(embed=embed)
+        embed, view = build_help_embed(p, self.bot)
+        await ctx.send(embed=embed, view=view)
 
     @commands.Cog.listener()
     async def on_message(self, message):
