@@ -35,20 +35,29 @@ fi
 venv/bin/pip install -q --upgrade pip
 venv/bin/pip install -r requirements.txt
 
-# voicevox-core は PyPI に存在しないため GitHub releases から取得する
+# voicevox-core は PyPI に存在しないため GitHub releases のアセット一覧から URL を取得する
 ARCH=$(uname -m)
 PY_VER=$(venv/bin/python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
-case "$ARCH" in
-    x86_64)  WHEEL_ARCH="linux_x86_64" ;;
-    aarch64) WHEEL_ARCH="linux_aarch64" ;;
-    *) echo "未対応アーキテクチャ: $ARCH"; exit 1 ;;
-esac
-echo "  アーキテクチャ: ${ARCH} → GitHubからvoicevox-coreを取得します..."
-LATEST=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-WHEEL="voicevox_core-${LATEST}+cpu-cp${PY_VER}-cp${PY_VER}-${WHEEL_ARCH}.whl"
-venv/bin/pip install -q \
-    "https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${WHEEL}"
+echo "  アーキテクチャ: ${ARCH} / Python cp${PY_VER} → voicevox-coreのURLを検索中..."
+WHEEL_URL=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+arch = '${ARCH}'
+pyver = 'cp${PY_VER}'
+urls = [
+    a['browser_download_url'] for a in data['assets']
+    if arch in a['name'] and pyver in a['name'] and 'cpu' in a['name'] and a['name'].endswith('.whl')
+]
+print(urls[0] if urls else '')
+")
+if [ -z "$WHEEL_URL" ]; then
+    echo "❌ voicevox-core の対応ホイールが見つかりませんでした"
+    echo "   https://github.com/VOICEVOX/voicevox_core/releases から手動でインストールしてください"
+    exit 1
+fi
+echo "  → $WHEEL_URL"
+venv/bin/pip install -q "$WHEEL_URL"
 ok "Pythonパッケージをインストールしました"
 
 # ─── 3. Open JTalk辞書 ──────────────────────────────────────────────
