@@ -45,13 +45,35 @@ LATEST=$(curl -fsSL -A "Kazekoshi-setup/3.0" -o /dev/null -w "%{url_effective}" 
     | grep -oE '[^/]+$') || {
     echo "❌ バージョン取得に失敗しました（ネットワークを確認してください）"; exit 1
 }
-LATEST_VER="${LATEST#v}"
 echo "  最新バージョン: ${LATEST}"
 
-WHEEL_NAME="voicevox_core-${LATEST_VER}-cp${PY_VER}-cp${PY_VER}-manylinux_2_28_${ARCH}.whl"
-WHEEL_URL="https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${WHEEL_NAME}"
-echo "  ホイール: ${WHEEL_NAME}"
+# expanded_assets ページから実際のホイールURLを取得（API不要・ファイル名推測不要）
+WHEEL_URL=$(python3 - <<PYEOF
+import urllib.request, re, sys
+tag  = "${LATEST}"
+arch = "${ARCH}"
+pyver = "${PY_VER}"
+url = f"https://github.com/VOICEVOX/voicevox_core/releases/expanded_assets/{tag}"
+req = urllib.request.Request(url, headers={"User-Agent": "Kazekoshi-setup/3.0"})
+try:
+    html = urllib.request.urlopen(req).read().decode()
+    # arch一致 & .whl で終わるassetリンクを探す（Python版不問でまず全取得）
+    all_whl = re.findall(r'href="(/[^"]*' + re.escape(arch) + r'[^"]*\.whl)"', html)
+    # 現在のPython版に一致するものを優先、なければ最初の候補
+    matched = [u for u in all_whl if f"cp{pyver}" in u or "py3" in u or "abi3" in u]
+    best = matched[0] if matched else (all_whl[0] if all_whl else "")
+    print("https://github.com" + best if best else "")
+except Exception as e:
+    print("", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+)
 
+if [ -z "$WHEEL_URL" ]; then
+    echo "❌ voicevox-core の対応ホイールが見つかりませんでした（tag=${LATEST}, ARCH=${ARCH}）"
+    exit 1
+fi
+echo "  ホイール: $(basename "${WHEEL_URL}")"
 venv/bin/pip install -q "${WHEEL_URL}" || {
     echo "❌ voicevox-core のインストールに失敗しました"
     echo "   試したURL: ${WHEEL_URL}"
