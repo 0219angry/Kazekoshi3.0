@@ -57,8 +57,8 @@ url = f"https://github.com/VOICEVOX/voicevox_core/releases/expanded_assets/{tag}
 req = urllib.request.Request(url, headers={"User-Agent": "Kazekoshi-setup/3.0"})
 try:
     html = urllib.request.urlopen(req).read().decode()
-    # arch一致 & .whl で終わるassetリンクを探す（Python版不問でまず全取得）
-    all_whl = re.findall(r'href="(/[^"]*' + re.escape(arch) + r'[^"]*\.whl)"', html)
+    # manylinux & arch一致 & .whl で終わるassetリンクを取得（macOS等を除外）
+    all_whl = re.findall(r'href="(/[^"]*manylinux[^"]*' + re.escape(arch) + r'[^"]*\.whl)"', html)
     # 現在のPython版に一致するものを優先、なければ最初の候補
     matched = [u for u in all_whl if f"cp{pyver}" in u or "py3" in u or "abi3" in u]
     best = matched[0] if matched else (all_whl[0] if all_whl else "")
