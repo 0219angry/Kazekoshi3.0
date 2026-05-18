@@ -38,32 +38,25 @@ ARCH=$(uname -m)
 PY_VER=$(venv/bin/python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
 echo "  アーキテクチャ: ${ARCH} → voicevox-core を検索中..."
 
-# GitHub API は User-Agent 必須。GITHUB_TOKEN があればレート制限を回避できる
-GH_HEADERS=(-H "User-Agent: Kazekoshi-setup/3.0")
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    GH_HEADERS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-fi
+# GitHub API（api.github.com）を使わずリリースページのリダイレクト先からバージョンを取得
+# → レート制限・認証不要
+LATEST=$(curl -fsSL -A "Kazekoshi-setup/3.0" -o /dev/null -w "%{url_effective}" \
+    "https://github.com/VOICEVOX/voicevox_core/releases/latest" \
+    | grep -oE '[^/]+$') || {
+    echo "❌ バージョン取得に失敗しました（ネットワークを確認してください）"; exit 1
+}
+LATEST_VER="${LATEST#v}"
+echo "  最新バージョン: ${LATEST}"
 
-RELEASE_JSON=$(curl -fsSL "${GH_HEADERS[@]}" \
-    "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" 2>&1) || {
-    echo "❌ GitHub API へのアクセスに失敗しました（レート制限の場合は GITHUB_TOKEN を設定してください）"
-    echo "   export GITHUB_TOKEN=<your_token> && bash setup.sh"
+WHEEL_NAME="voicevox_core-${LATEST_VER}-cp${PY_VER}-cp${PY_VER}-manylinux_2_28_${ARCH}.whl"
+WHEEL_URL="https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${WHEEL_NAME}"
+echo "  ホイール: ${WHEEL_NAME}"
+
+venv/bin/pip install -q "${WHEEL_URL}" || {
+    echo "❌ voicevox-core のインストールに失敗しました"
+    echo "   試したURL: ${WHEEL_URL}"
     exit 1
 }
-
-LATEST=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-WHEEL_URL=$(echo "$RELEASE_JSON" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-arch = '${ARCH}'
-urls = [a['browser_download_url'] for a in data['assets']
-        if arch in a['name'] and 'manylinux' in a['name'] and a['name'].endswith('.whl')]
-print(urls[0] if urls else '')
-")
-if [ -z "$WHEEL_URL" ]; then
-    echo "❌ voicevox-core の対応ホイールが見つかりませんでした（ARCH=${ARCH}）"; exit 1
-fi
-venv/bin/pip install -q "$WHEEL_URL"
 ok "Pythonパッケージをインストールしました"
 
 # ─── 3. VOICEVOXダウンローダー & ランタイム & 音声モデル ────────────
