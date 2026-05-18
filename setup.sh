@@ -37,7 +37,20 @@ venv/bin/pip install -r requirements.txt
 ARCH=$(uname -m)
 PY_VER=$(venv/bin/python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
 echo "  アーキテクチャ: ${ARCH} → voicevox-core を検索中..."
-RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest")
+
+# GitHub API は User-Agent 必須。GITHUB_TOKEN があればレート制限を回避できる
+GH_HEADERS=(-H "User-Agent: Kazekoshi-setup/3.0")
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    GH_HEADERS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+
+RELEASE_JSON=$(curl -fsSL "${GH_HEADERS[@]}" \
+    "https://api.github.com/repos/VOICEVOX/voicevox_core/releases/latest" 2>&1) || {
+    echo "❌ GitHub API へのアクセスに失敗しました（レート制限の場合は GITHUB_TOKEN を設定してください）"
+    echo "   export GITHUB_TOKEN=<your_token> && bash setup.sh"
+    exit 1
+}
+
 LATEST=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 WHEEL_URL=$(echo "$RELEASE_JSON" | python3 -c "
 import sys, json
@@ -48,7 +61,7 @@ urls = [a['browser_download_url'] for a in data['assets']
 print(urls[0] if urls else '')
 ")
 if [ -z "$WHEEL_URL" ]; then
-    echo "❌ voicevox-core の対応ホイールが見つかりませんでした"; exit 1
+    echo "❌ voicevox-core の対応ホイールが見つかりませんでした（ARCH=${ARCH}）"; exit 1
 fi
 venv/bin/pip install -q "$WHEEL_URL"
 ok "Pythonパッケージをインストールしました"
@@ -64,7 +77,8 @@ esac
 
 # ダウンローダーバイナリを取得
 if [ ! -f "$DL_BIN" ]; then
-    wget -q "https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${DL_BIN}"
+    wget -q --user-agent="Kazekoshi-setup/3.0" \
+        "https://github.com/VOICEVOX/voicevox_core/releases/download/${LATEST}/${DL_BIN}"
     chmod +x "$DL_BIN"
 fi
 
