@@ -97,15 +97,38 @@ if [ ! -f "$DL_BIN" ]; then
     chmod +x "$DL_BIN"
 fi
 
+# GITHUB_TOKEN が設定されていればダウンローダーに渡す
+DL_TOKEN_ARGS=()
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    DL_TOKEN_ARGS=(--github-token "${GITHUB_TOKEN}")
+fi
+
+# ダウンローダーを実行してファイルを取得するヘルパー
+_dl_voicevox() {
+    local only="$1" pattern="$2" dest="$3"
+    local tmpdir="voicevox_dl_tmp"
+    rm -rf "$tmpdir"
+    echo "y" | ./"$DL_BIN" --only "$only" -o "$tmpdir" "${DL_TOKEN_ARGS[@]}" 2>&1 \
+        | grep -v "^\[" || true
+    if ! ls "${tmpdir}/"${pattern} &>/dev/null 2>&1; then
+        echo ""
+        echo "❌ ダウンロードに失敗しました（GitHub APIレート制限の可能性があります）"
+        echo "   GitHub Personal Access Token を取得して再実行してください:"
+        echo "   export GITHUB_TOKEN=<your_token> && bash setup.sh"
+        echo "   トークン取得: https://github.com/settings/tokens （スコープ不要）"
+        rm -rf "$tmpdir"
+        exit 1
+    fi
+    find "$tmpdir/" -name "${pattern}" -exec cp {} "$dest/" \;
+    rm -rf "$tmpdir"
+}
+
 # ONNXランタイム（利用規約: 非商用・商用OK、クレジット表記必要）
-LIB_FILE=$(venv/bin/python -c "from voicevox_core.blocking import Onnxruntime; print(Onnxruntime.LIB_VERSIONED_FILENAME)")
 if ls lib/*.so* &>/dev/null 2>&1; then
     ok "ONNXランタイムは既に存在します"
 else
     echo "  ONNXランタイムをダウンロード中..."
-    echo "y" | ./"$DL_BIN" --only onnxruntime -o voicevox_dl_tmp 2>&1 | grep -v "^\[" || true
-    find voicevox_dl_tmp/ -name "*.so*" -exec cp {} lib/ \;
-    rm -rf voicevox_dl_tmp
+    _dl_voicevox onnxruntime "*.so*" lib
     ok "ONNXランタイムをインストールしました"
 fi
 
@@ -114,9 +137,7 @@ if ls models/*.vvm &>/dev/null 2>&1; then
     ok "音声モデルが存在します: $(ls models/*.vvm | wc -l) 件"
 else
     echo "  音声モデルをダウンロード中（数百MB・時間がかかります）..."
-    echo "y" | ./"$DL_BIN" --only models -o voicevox_dl_tmp 2>&1 | grep -v "^\[" || true
-    find voicevox_dl_tmp/ -name "*.vvm" -exec cp {} models/ \;
-    rm -rf voicevox_dl_tmp
+    _dl_voicevox models "*.vvm" models
     ok "音声モデルをダウンロードしました: $(ls models/*.vvm | wc -l) 件"
 fi
 
