@@ -3,10 +3,11 @@
 DISCORD_TOKEN      = your_discord_bot_token_here
 COMMAND_PREFIX     = !
 
-# ─── VOICEVOX ────────────────────────────────────────────────────
-# デフォルトの話者ID（3 = ずんだもんノーマル）
-SPEAKER_ID         = 3
-OPEN_JTALK_DICT_DIR = open_jtalk_dic_utf_8-1.11
+# ─── 読み上げ（edge-tts） ─────────────────────────────────────────
+# デフォルトの読み上げボイス（!voice コマンドで個人設定可能）
+# 選択肢: ja-JP-NanamiNeural / ja-JP-AoiNeural / ja-JP-MayuNeural /
+#         ja-JP-ShioriNeural / ja-JP-KeitaNeural / ja-JP-DaichiNeural / ja-JP-NaokiNeural
+DEFAULT_VOICE      = ja-JP-NanamiNeural
 
 # ─── OpenWeatherMap ──────────────────────────────────────────────
 OPEN_WEATHER_MAP_TOKEN = your_openweathermap_api_key_here
