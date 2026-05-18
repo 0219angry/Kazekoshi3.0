@@ -2,4 +2,3 @@ discord.py[voice]>=2.3.0
 requests
 google-genai
 yt-dlp
-edge-tts
