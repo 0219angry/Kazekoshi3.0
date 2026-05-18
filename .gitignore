@@ -12,3 +12,4 @@ download-linux-*
 run.sh
 venv/
 open_jtalk_dic_utf_8-1.11/
+ssh.key
