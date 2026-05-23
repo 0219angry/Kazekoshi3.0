@@ -65,7 +65,7 @@ class MusicCog(commands.Cog):
             return
 
         if ctx.guild.voice_client is None:
-            await ctx.author.voice.channel.connect()
+            await ctx.author.voice.channel.connect(self_deaf=True)
         elif ctx.guild.voice_client.channel != ctx.author.voice.channel:
             await ctx.guild.voice_client.move_to(ctx.author.voice.channel)
         self.text_channels[ctx.guild.id] = ctx.channel
@@ -172,6 +172,29 @@ class MusicCog(commands.Cog):
     async def play_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("曲名かURLを入力してね。例: `!play 夜に駆ける`")
+
+    # ─── イベント ────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if member.id != self.bot.user.id:
+            return
+        # Bot unexpectedly left voice while something was playing
+        if before.channel is None or after.channel is not None:
+            return
+        guild = before.channel.guild
+        if self.current.get(guild.id) is None:
+            return  # Queue was already cleared (e.g. !stop), intentional disconnect
+        self.queues[guild.id].appendleft(self.current.pop(guild.id))
+        await asyncio.sleep(5)
+        try:
+            await before.channel.connect(self_deaf=True)
+            await self._play_next(guild)
+        except Exception:
+            logger.exception("音声再接続失敗")
+            channel = self.text_channels.get(guild.id)
+            if channel:
+                await channel.send("❌ ボイスチャンネルへの再接続に失敗しました")
 
     # ─── 内部処理 ────────────────────────────────────────────────
 
