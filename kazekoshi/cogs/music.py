@@ -23,7 +23,7 @@ FFMPEG_OPTIONS = {
 }
 
 
-async def fetch_track(query: str) -> dict | None:
+async def fetch_track(query: str) -> dict:
     loop = asyncio.get_event_loop()
     def _extract():
         with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
@@ -36,11 +36,7 @@ async def fetch_track(query: str) -> dict | None:
                 "duration": info.get("duration", 0),
                 "webpage_url": info.get("webpage_url", ""),
             }
-    try:
-        return await loop.run_in_executor(None, _extract)
-    except Exception:
-        logger.exception(f"yt-dlp エラー: {query}")
-        return None
+    return await loop.run_in_executor(None, _extract)
 
 
 def fmt_duration(sec: int) -> str:
@@ -71,11 +67,12 @@ class MusicCog(commands.Cog):
         self.text_channels[ctx.guild.id] = ctx.channel
 
         async with ctx.typing():
-            track = await fetch_track(query)
-
-        if track is None:
-            await ctx.send("❌ 見つからなかった")
-            return
+            try:
+                track = await fetch_track(query)
+            except Exception as e:
+                logger.exception(f"yt-dlp エラー: {query}")
+                await ctx.send(f"❌ 見つからなかった\n```{type(e).__name__}: {e}```")
+                return
 
         track["requester"] = ctx.author.display_name
         self.queues[ctx.guild.id].append(track)
