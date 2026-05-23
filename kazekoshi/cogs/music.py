@@ -106,7 +106,12 @@ def fmt_duration(sec: int) -> str:
 
 
 def _is_playlist_url(query: str) -> bool:
-    return "list=" in query
+    # 動画URLに list= が付いている場合は単曲として扱う（プレイリストから共有した動画など）
+    if "list=" not in query:
+        return False
+    if "watch?v=" in query or "youtu.be/" in query:
+        return False
+    return True
 
 
 class MusicCog(commands.Cog):
@@ -472,17 +477,26 @@ class MusicCog(commands.Cog):
             track = q.popleft()
             self.current[guild.id] = track
 
-        # 履歴に追加（1曲ループ中は重複させない）
-        if effective_loop != "one":
-            self.history[guild.id].append(track)
-
-        # 保存済みプレイリスト由来のトラックはストリームURLを再取得
+        # ストリームURLを確保（プレイリスト由来は再取得が必要）
         stream_url = track.get("url", "")
         if not stream_url or stream_url == track.get("webpage_url", ""):
             refreshed = await fetch_track(track["webpage_url"])
             if refreshed:
                 stream_url = refreshed["url"]
                 track["url"] = stream_url
+
+        # 取得失敗時はスキップして次の曲へ
+        if not stream_url or stream_url == track.get("webpage_url", ""):
+            channel = self.text_channels.get(guild.id) or guild.text_channels[0]
+            await channel.send(f"⚠️ **{track['title']}** の再生情報を取得できなかったのでスキップ")
+            if self.current.get(guild.id) is track:
+                self.current.pop(guild.id, None)
+            asyncio.create_task(self._play_next(guild))
+            return
+
+        # 履歴に追加（1曲ループ中は重複させない）
+        if effective_loop != "one":
+            self.history[guild.id].append(track)
 
         source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
         source = discord.PCMVolumeTransformer(source, volume=self.volumes[guild.id])
