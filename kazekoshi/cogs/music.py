@@ -1,4 +1,6 @@
 import asyncio
+import configparser
+import os
 from collections import defaultdict, deque
 from logging import getLogger
 
@@ -8,19 +10,31 @@ import yt_dlp
 
 logger = getLogger(__name__)
 
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-}
-
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn -ar 48000 -ac 2",
 }
+
+
+def _build_ytdl_options() -> dict:
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch",
+        "source_address": "0.0.0.0",
+    }
+    config = configparser.ConfigParser()
+    config.read("config.ini", encoding="UTF-8")
+    cookies_path = config["DEFAULT"].get("YOUTUBE_COOKIES_FILE", "").strip()
+    if cookies_path and os.path.isfile(cookies_path):
+        opts["cookiefile"] = cookies_path
+        logger.info(f"yt-dlp: cookiefile={cookies_path}")
+    return opts
+
+
+YTDL_OPTIONS = _build_ytdl_options()
 
 
 async def fetch_track(query: str) -> dict:

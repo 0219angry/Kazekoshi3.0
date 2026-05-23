@@ -21,3 +21,9 @@ DEFAULT_CITY = 東京
 # https://aistudio.google.com/apikey でAPIキーを取得
 # 不要なら空のままにしてください（AI機能が無効になります）
 GEMINI_API_KEY     = your_gemini_api_key_here
+
+# ─── YouTube (yt-dlp) ────────────────────────────────────────────
+# Bot検出回避用クッキーファイルのパス（Netscape形式 cookies.txt）
+# 空のままにすると未使用（YouTube がBot判定した場合に設定）
+# エクスポート方法: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
+YOUTUBE_COOKIES_FILE = cookies.txt
