@@ -115,6 +115,17 @@ config.ini            # 設定ファイル（config.ini.example をコピーし�
 |---|---|
 | `/poll [質問] [選択肢]` | 最大10択の投票を作成（選択肢はカンマ区切り） |
 | `/quickpoll [質問]` | 👍 / 👎 の簡易投票を作成 |
+| `/schedule add role:@VALORANT options:21 22 23 ng` | #valorant に日程投票を作成（候補は省略可） |
+| `/schedule update message:<投稿IDまたはリンク> options:21 22 24 ng` | 候補を更新して投票をリセット |
+
+- `/schedule` はDiscordのスラッシュコマンドと、設定したプレフィックスの両方に対応
+- `add` の候補を省略した場合は `20 21 22 23 24 ng` を使用
+- 候補省略時のみ、`ng` を除く `20 → 21 → 22 → 23 → 24` の早い順で重複しない投票者を累計。5人目が加わった時刻で `24時開始 @VALORANT` のように一度だけ通知
+- 明示的に候補を指定した投票と `update` 後の投票では、自動開始通知を行わない
+- 候補は空白区切りで2〜10個。空白を含む候補は `"8/21 21時"` のように引用符で囲む
+- 複数候補への投票が可能
+- `update` は作成者またはメッセージ管理権限を持つユーザーだけが実行可能
+- `VALORANT_CHANNEL_ID` が設定されている場合はそのチャンネル（および配下のスレッド）に限定。`0` の場合は `#valorant` を名前で判定
 
 ---
 
@@ -196,6 +207,7 @@ python Kazekoshi.py
 |---|---|
 | `DISCORD_TOKEN` | Discord Bot のトークン（必須） |
 | `COMMAND_PREFIX` | プレフィックス（デフォルト: `!`） |
+| `VALORANT_CHANNEL_ID` | `/schedule` を許可するチャンネルID（`0` なら `#valorant` を名前で判定） |
 | `SPEAKER_ID` | VOICEVOXのデフォルト話者ID（デフォルト: `3` = ずんだもんノーマル） |
 | `OPEN_JTALK_DICT_DIR` | Open JTalk 辞書のパス |
 | `OPEN_WEATHER_MAP_TOKEN` | OpenWeatherMap API キー（天気機能に必要） |

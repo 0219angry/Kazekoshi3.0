@@ -88,6 +88,8 @@ HELP_SECTIONS = {
         "cmds": [
             ("{p}poll [質問] [選択肢]", "投票を作成（最大10択）"),
             ("{p}quickpoll [質問]",     "👍 / 👎 の簡易投票"),
+            ("{p}schedule add @ロール [候補...]", "#valorant に開始時間投票を作成"),
+            ("{p}schedule update [投稿ID] [候補...]", "日程投票を更新・票をリセット"),
             ("{p}userinfo [メンバー]",  "ユーザー情報を表示"),
             ("{p}serverinfo",           "サーバー情報を表示"),
             ("{p}avatar [メンバー]",    "アバターを表示"),
