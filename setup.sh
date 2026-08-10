@@ -99,17 +99,18 @@ _dl_voicevox() {
     local only="$1" pattern="$2" dest="$3"
     local tmpdir="voicevox_dl_tmp"
     rm -rf "$tmpdir"
-    # yes コマンドで同意プロンプトに自動応答（echo "y" と異なり繰り返し出力する）
-    yes | ./"$DL_BIN" --only "$only" -o "$tmpdir" "${DL_TOKEN_ARGS[@]}" 2>&1 \
+    # ページャーのクラッシュ回避（日本語規約でminusがpanicする）
+    PAGER=cat TERM=dumb yes | ./"$DL_BIN" --only "$only" -o "$tmpdir" "${DL_TOKEN_ARGS[@]}" 2>&1 \
         | grep -v "^\[" || true
-    if ! ls "${tmpdir}/"${pattern} &>/dev/null 2>&1; then
+    # サブディレクトリ配下も含めて再帰的に探す
+    if [ -z "$(find "$tmpdir" -name "$pattern" -type f 2>/dev/null)" ]; then
         echo ""
         echo "❌ ダウンロードに失敗しました（GitHub APIレート制限の場合は GITHUB_TOKEN を設定してください）"
         echo "   export GITHUB_TOKEN=<your_token> && bash setup.sh"
-        rm -rf "$tmpdir"
         exit 1
     fi
-    find "$tmpdir/" -name "${pattern}" -exec cp {} "$dest/" \;
+    # シンボリックリンクを保持してコピー
+    find "$tmpdir" -name "$pattern" -exec cp -P {} "$dest/" \;
     rm -rf "$tmpdir"
 }
 
