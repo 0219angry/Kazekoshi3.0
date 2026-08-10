@@ -91,16 +91,12 @@ fi
 
 # GITHUB_TOKEN が設定されていればダウンローダーに渡す
 DL_TOKEN_ARGS=()
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    DL_TOKEN_ARGS=(--github-token "${GITHUB_TOKEN}")
-fi
-
 _dl_voicevox() {
     local only="$1" pattern="$2" dest="$3"
     local tmpdir="voicevox_dl_tmp"
     rm -rf "$tmpdir"
     # ページャーのクラッシュ回避（日本語規約でminusがpanicする）
-    PAGER=cat TERM=dumb yes | ./"$DL_BIN" --only "$only" -o "$tmpdir" "${DL_TOKEN_ARGS[@]}" 2>&1 \
+    PAGER=cat TERM=dumb yes | ./"$DL_BIN" --only "$only" -o "$tmpdir" 2>&1 \
         | grep -v "^\[" || true
     # サブディレクトリ配下も含めて再帰的に探す
     if [ -z "$(find "$tmpdir" -name "$pattern" -type f 2>/dev/null)" ]; then
