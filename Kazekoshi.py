@@ -33,6 +33,7 @@ try:
     config.read("config.ini", encoding="UTF-8")
     DISCORD_TOKEN = config["DEFAULT"]["DISCORD_TOKEN"]
     COMMAND_PREFIX = config["DEFAULT"].get("COMMAND_PREFIX", "!")
+    VALORANT_CHANNEL_ID = config["DEFAULT"].getint("VALORANT_CHANNEL_ID", fallback=0)
 except Exception:
     logger.exception("config.ini の読み込みに失敗しました")
     sys.exit(1)
@@ -60,6 +61,11 @@ class KazekoshiBot(commands.Bot):
                 logger.info(f"Loaded cog: {cog}")
             except Exception:
                 logger.exception(f"Cog の読み込みに失敗しました: {cog}")
+        try:
+            synced_commands = await self.tree.sync()
+            logger.info(f"Synced {len(synced_commands)} application command(s)")
+        except Exception:
+            logger.exception("Application command の同期に失敗しました")
 
     async def on_ready(self):
         logger.info(f"Kazekoshi v3.0 on ready (discord.py v{discord.__version__})")
@@ -68,6 +74,7 @@ class KazekoshiBot(commands.Bot):
 
 intents = discord.Intents.all()
 bot = KazekoshiBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+bot.valorant_channel_id = VALORANT_CHANNEL_ID
 
 try:
     bot.run(DISCORD_TOKEN)
