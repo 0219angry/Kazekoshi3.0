@@ -3,8 +3,9 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import discord
 from discord.ext import commands
@@ -15,8 +16,10 @@ from kazekoshi.cogs.poll import (
     DEFAULT_SCHEDULE_OPTIONS,
     DEFAULT_SCHEDULE_OPTION_LIST,
     EMOJI_NUMBERS,
+    LATENESS_REACTION_GRACE_SECONDS,
     OPTION_EMOJIS,
     PollCog,
+    ScheduleEffectConfig,
     ScheduleInputError,
     SchedulePollRegistry,
     announced_start_time,
@@ -28,6 +31,7 @@ from kazekoshi.cogs.poll import (
     format_schedule_options,
     is_auto_start_schedule,
     is_schedule_closed,
+    load_schedule_effect_config,
     mark_schedule_closed,
     mark_start_time_announced,
     normalize_schedule_time,
@@ -36,11 +40,14 @@ from kazekoshi.cogs.poll import (
     parse_schedule_deadline,
     parse_message_id,
     parse_schedule_options,
+    parse_schedule_effect_user_ids,
     schedule_author_id,
     schedule_date_override,
     schedule_decided_start_time,
     schedule_deadline_at,
     schedule_event_date,
+    schedule_effect_frames,
+    schedule_effect_for_roll,
     schedule_option_emojis,
     schedule_options_from_embed,
     schedule_related_notification_id,
@@ -247,6 +254,72 @@ class ScheduleHarness:
 
 
 class ScheduleParsingTests(unittest.TestCase):
+    def test_schedule_effect_roll_probabilities_use_sixteen_outcomes(self):
+        outcomes = [schedule_effect_for_roll(roll) for roll in range(1, 17)]
+        self.assertEqual(outcomes.count("rush"), 1)
+        self.assertEqual(outcomes.count("chance"), 2)
+        self.assertEqual(outcomes.count("miss"), 5)
+        self.assertEqual(outcomes.count(None), 8)
+
+    def test_schedule_effect_user_ids_accept_spaces_commas_and_duplicates(self):
+        self.assertEqual(
+            parse_schedule_effect_user_ids("123, 456\n123 789"),
+            frozenset({123, 456, 789}),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid Discord user ID"):
+            parse_schedule_effect_user_ids("123, player")
+
+    def test_load_schedule_effect_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.ini"
+            config_path.write_text(
+                "[SCHEDULE_EFFECT]\n"
+                "ENABLED = true\n"
+                "USER_IDS = 123, 456\n"
+                "DELETE_AFTER_SECONDS = 8\n",
+                encoding="UTF-8",
+            )
+
+            config = load_schedule_effect_config(config_path)
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.user_ids, frozenset({123, 456}))
+        self.assertEqual(config.delete_after_seconds, 8)
+
+    def test_schedule_effect_frames_are_fixed_for_message_edits(self):
+        self.assertEqual(
+            schedule_effect_frames("rush", user_id=123),
+            (
+                "🔴 先バレ <@123>",
+                "🔴 先バレ <@123>\n\nﾌﾟﾁｭﾝ……",
+                "🌈 ７ ７ ７ 🌈\n**風越RUSH突入!!**\n<@123> 参戦決定!!",
+            ),
+        )
+        self.assertEqual(
+            schedule_effect_frames("rush", user_id=123, start_time="20:00"),
+            (
+                "🔴 先バレ <@123>",
+                "🔴 先バレ <@123>\n\nﾌﾟﾁｭﾝ……",
+                "🌈 ７ ７ ７ 🌈\n**風越RUSH突入!!**\n20:00 開始",
+            ),
+        )
+        self.assertEqual(
+            schedule_effect_frames("chance", user_id=123),
+            (
+                "🟡 保留変化 <@123>",
+                "🟠 チャンス……？ <@123>",
+                "✨ <@123> 参戦決定!!",
+            ),
+        )
+        self.assertEqual(
+            schedule_effect_frames("miss", user_id=123),
+            (
+                "⚪ 通常保留 <@123>",
+                "⚪ 通常保留 <@123>\n\n……",
+                "💨 ハズレ <@123>",
+            ),
+        )
+
     def test_parse_space_separated_options(self):
         self.assertEqual(
             parse_schedule_options("21:00 22:00 23:00 NG"),
@@ -778,6 +851,36 @@ class SchedulePollRegistryTests(unittest.TestCase):
         self.assertEqual(stored.deadline_at, deadline_at)
         self.registry.clear_deadline(message_id)
         self.assertIsNone(self.registry.all()[0].deadline_at)
+
+    def test_schedule_effect_draw_and_jackpot_claims_survive_restart(self):
+        message_id = schedule_snowflake(FIXED_NOW - timedelta(days=1))
+        self.registry.register(
+            guild_id=1,
+            channel_id=10,
+            message_id=message_id,
+        )
+
+        self.assertEqual(
+            self.registry.claim_effect_draw(message_id, 123),
+            (True, False),
+        )
+        restarted_registry = SchedulePollRegistry(self.registry.path)
+        self.assertEqual(
+            restarted_registry.claim_effect_draw(message_id, 123),
+            (False, False),
+        )
+        self.assertTrue(restarted_registry.claim_effect_jackpot(message_id, 123))
+        self.assertFalse(restarted_registry.claim_effect_jackpot(message_id, 123))
+        self.assertEqual(
+            restarted_registry.claim_effect_draw(message_id, 123),
+            (False, True),
+        )
+
+        restarted_registry.unregister(message_id)
+        self.assertEqual(
+            restarted_registry.claim_effect_draw(message_id, 123),
+            (True, False),
+        )
 
     def test_prune_preserves_poll_with_deadline(self):
         cutoff_id = schedule_snowflake(FIXED_NOW - timedelta(days=90))
@@ -1965,6 +2068,34 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             discord.AllowedMentions.none().to_dict(),
         )
 
+    def enable_schedule_effect(self, user_ids, rolls):
+        self.harness.cog._effect_config = ScheduleEffectConfig(
+            enabled=True,
+            user_ids=frozenset(user_ids),
+            delete_after_seconds=8,
+        )
+        self.harness.cog._effect_roll = Mock(side_effect=rolls)
+        self.harness.cog._effect_sleep = AsyncMock()
+
+    async def run_effect_reaction(self, *, emoji="1️⃣", user_id=2):
+        await self.harness.cog.on_raw_reaction_add(
+            self.harness.payload(emoji=emoji, user_id=user_id)
+        )
+        effect_tasks = list(self.harness.cog._effect_tasks)
+        self.assertEqual(len(effect_tasks), 1)
+        await asyncio.gather(*effect_tasks)
+
+    def assert_effect_message(self, message_id, expected_frames):
+        effect_message = self.harness.notifications[message_id]
+        self.assertEqual(effect_message.content, expected_frames[-1])
+        self.assertEqual(
+            [edit.kwargs["content"] for edit in effect_message.edit.await_args_list],
+            list(expected_frames[1:]),
+        )
+        for edit in effect_message.edit.await_args_list:
+            self.assert_allowed_mentions_none(edit.kwargs["allowed_mentions"])
+        effect_message.delete.assert_awaited_once()
+
     def decision_context(self):
         permissions = SimpleNamespace(
             mention_everyone=True,
@@ -2016,13 +2147,14 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assert_allowed_mentions_none(cancellation["allowed_mentions"])
 
-    async def test_waits_ten_seconds_and_persists_first_notification_id(self):
-        self.assertEqual(AUTO_START_GRACE_SECONDS, 10)
+    async def test_waits_eight_seconds_and_persists_first_notification_id(self):
+        self.assertEqual(AUTO_START_GRACE_SECONDS, 8)
+        self.assertEqual(LATENESS_REACTION_GRACE_SECONDS, 8)
         self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
 
         sleep_call, task = await self.queue_check()
 
-        self.assertEqual(sleep_call.delay, 10)
+        self.assertEqual(sleep_call.delay, 8)
         self.assertFalse(task.done())
         self.harness.channel.fetch_message.assert_not_awaited()
         self.harness.channel.send.assert_not_awaited()
@@ -2036,6 +2168,120 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, 1000)
+
+    async def test_schedule_effect_roll_one_plays_rush_once_and_deletes_it(self):
+        self.enable_schedule_effect({2}, [1])
+        self.harness.set_voters({"20:00": {2}})
+
+        await self.run_effect_reaction(user_id=2)
+
+        self.assert_effect_message(
+            1000,
+            schedule_effect_frames("rush", user_id=2),
+        )
+        self.assertEqual(
+            self.harness.cog._effect_sleep.await_args_list,
+            [call(1.0), call(1.0), call(6.0)],
+        )
+        self.assert_allowed_mentions_none(
+            self.harness.notifications[1000].allowed_mentions
+        )
+
+        self.harness.channel.send.reset_mock()
+        self.harness.set_voters({"20:00": {2}, "20:30": {2}})
+        await self.harness.cog.on_raw_reaction_add(
+            self.harness.payload(emoji="2️⃣", user_id=2)
+        )
+        repeated_tasks = list(self.harness.cog._effect_tasks)
+        await asyncio.gather(*repeated_tasks)
+
+        self.harness.channel.send.assert_not_awaited()
+        self.assertEqual(self.harness.cog._effect_roll.call_count, 1)
+
+    async def test_schedule_effect_rolls_two_and_three_play_chance(self):
+        self.enable_schedule_effect({2, 3}, [2, 3])
+        self.harness.set_voters({"20:00": {2, 3}})
+
+        await self.run_effect_reaction(user_id=2)
+        await self.run_effect_reaction(user_id=3)
+
+        self.assert_effect_message(
+            1000,
+            schedule_effect_frames("chance", user_id=2),
+        )
+        self.assert_effect_message(
+            1001,
+            schedule_effect_frames("chance", user_id=3),
+        )
+
+    async def test_schedule_effect_rolls_four_through_eight_play_miss(self):
+        user_ids = set(range(2, 7))
+        self.enable_schedule_effect(user_ids, [4, 5, 6, 7, 8])
+
+        for user_id in sorted(user_ids):
+            self.harness.set_voters({"20:00": {user_id}})
+            await self.run_effect_reaction(user_id=user_id)
+
+        for message_id, user_id in zip(range(1000, 1005), sorted(user_ids)):
+            self.assert_effect_message(
+                message_id,
+                schedule_effect_frames("miss", user_id=user_id),
+            )
+        self.assertEqual(self.harness.cog._effect_roll.call_count, 5)
+
+    async def test_schedule_effect_rolls_nine_through_sixteen_show_nothing(self):
+        user_ids = set(range(2, 10))
+        self.enable_schedule_effect(user_ids, list(range(9, 17)))
+
+        for user_id in sorted(user_ids):
+            self.harness.set_voters({"20:00": {user_id}})
+            await self.run_effect_reaction(user_id=user_id)
+
+        self.harness.channel.send.assert_not_awaited()
+        self.assertEqual(self.harness.cog._effect_roll.call_count, 8)
+
+    async def test_non_target_user_does_not_draw_or_play_effect(self):
+        self.enable_schedule_effect({2}, [1])
+        self.harness.set_voters({"20:00": {3}})
+
+        await self.harness.cog.on_raw_reaction_add(
+            self.harness.payload(user_id=3)
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(self.harness.cog._effect_tasks, {})
+        self.harness.cog._effect_roll.assert_not_called()
+        self.harness.channel.send.assert_not_awaited()
+
+    async def test_deciding_vote_always_plays_rush_without_random_draw(self):
+        self.enable_schedule_effect({6}, [16])
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
+
+        await self.run_effect_reaction(user_id=6)
+
+        self.assert_effect_message(
+            1000,
+            schedule_effect_frames("rush", user_id=6, start_time="20:00"),
+        )
+        self.harness.cog._effect_roll.assert_not_called()
+
+    async def test_deciding_readd_gets_rush_after_normal_draw_was_used(self):
+        self.enable_schedule_effect({6}, [16])
+        self.harness.set_voters({"20:00": {2, 3, 6}})
+        await self.run_effect_reaction(user_id=6)
+        self.harness.channel.send.assert_not_awaited()
+
+        await self.harness.cog.on_raw_reaction_remove(
+            self.harness.payload(user_id=6)
+        )
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
+        await self.run_effect_reaction(user_id=6)
+
+        self.assert_effect_message(
+            1000,
+            schedule_effect_frames("rush", user_id=6, start_time="20:00"),
+        )
+        self.assertEqual(self.harness.cog._effect_roll.call_count, 1)
 
     async def test_decide_reuses_matching_auto_start_notification(self):
         notification = await self.announce(
@@ -2366,7 +2612,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.harness.bot.wait_until_ready.assert_awaited_once()
-        self.assertEqual(self.sleeper.calls[0].delay, 10)
+        self.assertEqual(self.sleeper.calls[0].delay, 8)
         self.harness.channel.fetch_message.assert_not_awaited()
         self.harness.channel.send.assert_not_awaited()
 
@@ -2377,7 +2623,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(announcement.start_time, "21:00")
         self.assertEqual(announcement.message_id, 1000)
 
-    async def test_reaction_removed_within_ten_seconds_prevents_notification(self):
+    async def test_reaction_removed_within_eight_seconds_prevents_notification(self):
         self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check()
 
@@ -2387,7 +2633,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             emoji="1️⃣",
         )
 
-        self.assertEqual(first_sleep.delay, 10)
+        self.assertEqual(first_sleep.delay, 8)
         self.assertTrue(first_sleep.future.cancelled())
         self.assertTrue(first_task.cancelled())
         self.harness.channel.send.assert_not_awaited()
@@ -2411,7 +2657,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_sleep.future.cancelled())
         self.assertTrue(first_task.cancelled())
         self.assertTrue(second_task.cancelled())
-        self.assertEqual([call.delay for call in self.sleeper.calls], [10, 10, 10])
+        self.assertEqual([call.delay for call in self.sleeper.calls], [8, 8, 8])
         self.harness.channel.fetch_message.assert_not_awaited()
 
         await self.finish_check(third_sleep, third_task)
@@ -2787,7 +3033,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             emoji="🆖",
         )
 
-        self.assertEqual(sleep_call.delay, 10)
+        self.assertEqual(sleep_call.delay, 8)
         self.harness.poll_message.add_reaction.assert_not_awaited()
         self.harness.channel.send.assert_not_awaited()
 
@@ -2886,7 +3132,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await transition_task
         self.assertFalse(pending_check.done())
-        self.assertEqual(self.sleeper.calls[1].delay, 10)
+        self.assertEqual(self.sleeper.calls[1].delay, 8)
         self.assertIsNone(start_announcement(self.harness.poll_message.embeds[0]))
         self.assertEqual(self.harness.poll_message.edit.await_count, 2)
         self.assertNotIn(

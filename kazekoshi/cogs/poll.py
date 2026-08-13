@@ -1,4 +1,6 @@
 import asyncio
+import configparser
+import random
 import re
 import shlex
 import sqlite3
@@ -68,9 +70,15 @@ SCHEDULE_ENTRY_PATTERN = re.compile(
 AUTO_START_THRESHOLD = 5
 AUTO_START_MINIMUM_MIN = 1
 AUTO_START_MINIMUM_MAX = 999
-AUTO_START_GRACE_SECONDS = 10
+AUTO_START_GRACE_SECONDS = 8
 AUTO_START_MAX_RETRIES = 2
 AUTO_START_NOTICE_RETRY_DELAY_SECONDS = 2
+SCHEDULE_EFFECT_ROLL_SIDES = 16
+SCHEDULE_EFFECT_RUSH_ROLLS = frozenset({1})
+SCHEDULE_EFFECT_CHANCE_ROLLS = frozenset({2, 3})
+SCHEDULE_EFFECT_MISS_ROLLS = frozenset({4, 5, 6, 7, 8})
+SCHEDULE_EFFECT_STEP_SECONDS = 1.0
+SCHEDULE_EFFECT_DELETE_AFTER_SECONDS = 8.0
 SCHEDULE_RETENTION_DAYS = 90
 SCHEDULE_REGISTRY_PATH = Path("json/schedule_polls.sqlite3")
 SCHEDULE_TIMEZONE = ZoneInfo("Asia/Tokyo")
@@ -82,7 +90,7 @@ SCHEDULE_RELATED_NOTIFICATION_ID_LABEL = "関連通知ID"
 SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
 LATEST_SCHEDULE_HISTORY_LIMIT = 100
-LATENESS_REACTION_GRACE_SECONDS = 2
+LATENESS_REACTION_GRACE_SECONDS = 8
 LATENESS_REMINDER_MAX_MENTIONS = 80
 LATENESS_YEAR_MONTH_PATTERN = re.compile(
     r"(?P<year>[0-9]{4})[-/]?(?P<month>[0-9]{2})"
@@ -157,6 +165,104 @@ class LatenessStatsPeriod:
     label: str
 
 
+@dataclass(frozen=True)
+class ScheduleEffectConfig:
+    """設定対象ユーザーだけに表示する開始時間投票の遊技演出。"""
+
+    enabled: bool = False
+    user_ids: frozenset[int] = frozenset()
+    delete_after_seconds: float = SCHEDULE_EFFECT_DELETE_AFTER_SECONDS
+
+
+def parse_schedule_effect_user_ids(value: str) -> frozenset[int]:
+    """空白またはカンマ区切りのDiscordユーザーIDを解析する。"""
+    user_ids: set[int] = set()
+    for token in re.split(r"[\s,]+", value.strip()):
+        if not token:
+            continue
+        if not token.isdecimal() or int(token) <= 0:
+            raise ValueError(f"invalid Discord user ID: {token}")
+        user_ids.add(int(token))
+    return frozenset(user_ids)
+
+
+def load_schedule_effect_config(
+    path: str | Path = "config.ini",
+) -> ScheduleEffectConfig:
+    """風越RUSH設定を読む。不正な設定では安全側に倒して無効化する。"""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="UTF-8")
+        if not parser.has_section("SCHEDULE_EFFECT"):
+            return ScheduleEffectConfig()
+        section = parser["SCHEDULE_EFFECT"]
+        enabled = section.getboolean("ENABLED", fallback=False)
+        user_ids = parse_schedule_effect_user_ids(
+            section.get("USER_IDS", fallback="")
+        )
+        delete_after_seconds = section.getfloat(
+            "DELETE_AFTER_SECONDS",
+            fallback=SCHEDULE_EFFECT_DELETE_AFTER_SECONDS,
+        )
+        if not 2 <= delete_after_seconds <= 60:
+            raise ValueError("DELETE_AFTER_SECONDS must be between 2 and 60")
+    except (configparser.Error, OSError, ValueError):
+        logger.exception("風越RUSHの設定を読み込めなかったため無効化します")
+        return ScheduleEffectConfig()
+    return ScheduleEffectConfig(
+        enabled=enabled and bool(user_ids),
+        user_ids=user_ids,
+        delete_after_seconds=delete_after_seconds,
+    )
+
+
+def schedule_effect_frames(
+    effect: str,
+    *,
+    user_id: int,
+    start_time: str | None = None,
+) -> tuple[str, str, str]:
+    """演出中に同じメッセージへ順番に表示する文面を返す。"""
+    user_mention = f"<@{user_id}>"
+    if effect == "rush":
+        result = (
+            f"{format_start_label(start_time)}"
+            if start_time is not None
+            else f"{user_mention} 参戦決定!!"
+        )
+        return (
+            f"🔴 先バレ {user_mention}",
+            f"🔴 先バレ {user_mention}\n\nﾌﾟﾁｭﾝ……",
+            f"🌈 ７ ７ ７ 🌈\n**風越RUSH突入!!**\n{result}",
+        )
+    if effect == "chance":
+        return (
+            f"🟡 保留変化 {user_mention}",
+            f"🟠 チャンス……？ {user_mention}",
+            f"✨ {user_mention} 参戦決定!!",
+        )
+    if effect == "miss":
+        return (
+            f"⚪ 通常保留 {user_mention}",
+            f"⚪ 通常保留 {user_mention}\n\n……",
+            f"💨 ハズレ {user_mention}",
+        )
+    raise ValueError(f"unknown schedule effect: {effect}")
+
+
+def schedule_effect_for_roll(roll: int) -> str | None:
+    """16面抽選をRUSH・CHANCE・ハズレ・演出なしへ分ける。"""
+    if not 1 <= roll <= SCHEDULE_EFFECT_ROLL_SIDES:
+        raise ValueError("schedule effect roll must be between 1 and 16")
+    if roll in SCHEDULE_EFFECT_RUSH_ROLLS:
+        return "rush"
+    if roll in SCHEDULE_EFFECT_CHANCE_ROLLS:
+        return "chance"
+    if roll in SCHEDULE_EFFECT_MISS_ROLLS:
+        return "miss"
+    return None
+
+
 class SchedulePollRegistry:
     """再起動後に自動開始投票を再評価するための小さなSQLiteレジストリ。"""
 
@@ -184,6 +290,16 @@ class SchedulePollRegistry:
             connection.execute(
                 "ALTER TABLE schedule_polls ADD COLUMN deadline_at REAL"
             )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedule_effect_draws (
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                jackpot_played INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, user_id)
+            )
+            """
+        )
         return connection
 
     def register(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
@@ -241,9 +357,52 @@ class SchedulePollRegistry:
         with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
+                    "DELETE FROM schedule_effect_draws WHERE message_id = ?",
+                    (message_id,),
+                )
+                connection.execute(
                     "DELETE FROM schedule_polls WHERE message_id = ?",
                     (message_id,),
                 )
+
+    def claim_effect_draw(self, message_id: int, user_id: int) -> tuple[bool, bool]:
+        """通常抽選を原子的に取得し、既に確定演出済みかも返す。"""
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO schedule_effect_draws
+                        (message_id, user_id, jackpot_played)
+                    VALUES (?, ?, 0)
+                    """,
+                    (message_id, user_id),
+                )
+                row = connection.execute(
+                    """
+                    SELECT jackpot_played
+                    FROM schedule_effect_draws
+                    WHERE message_id = ? AND user_id = ?
+                    """,
+                    (message_id, user_id),
+                ).fetchone()
+        return cursor.rowcount == 1, bool(row[0])
+
+    def claim_effect_jackpot(self, message_id: int, user_id: int) -> bool:
+        """決定打の確定演出を1度だけ原子的に取得する。"""
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO schedule_effect_draws
+                        (message_id, user_id, jackpot_played)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(message_id, user_id) DO UPDATE SET
+                        jackpot_played = 1
+                    WHERE schedule_effect_draws.jackpot_played = 0
+                    """,
+                    (message_id, user_id),
+                )
+        return cursor.rowcount == 1
 
     def all(self) -> list[RegisteredSchedulePoll]:
         with closing(self._connect()) as connection:
@@ -267,6 +426,12 @@ class SchedulePollRegistry:
                     """,
                     (cutoff_message_id,),
                 ).fetchall()
+                expired_message_ids = [row[2] for row in rows]
+                if expired_message_ids:
+                    connection.executemany(
+                        "DELETE FROM schedule_effect_draws WHERE message_id = ?",
+                        ((message_id,) for message_id in expired_message_ids),
+                    )
                 connection.execute(
                     """
                     DELETE FROM schedule_polls
@@ -1343,9 +1508,12 @@ class PollCog(commands.Cog):
         deadline_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         lateness_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         lateness_reaction_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        effect_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         registry: SchedulePollRegistry | None = None,
         lateness_registry: ScheduleLatenessRegistry | None = None,
+        effect_config: ScheduleEffectConfig | None = None,
+        effect_roller: Callable[[], int] | None = None,
     ):
         self.bot = bot
         self._auto_start_grace_seconds = auto_start_grace_seconds
@@ -1354,6 +1522,7 @@ class PollCog(commands.Cog):
         self._deadline_sleep = deadline_sleeper
         self._lateness_sleep = lateness_sleeper
         self._lateness_reaction_sleep = lateness_reaction_sleeper
+        self._effect_sleep = effect_sleeper
         self._now = now_provider
         self._schedule_registry = registry or SchedulePollRegistry()
         self._lateness_registry = lateness_registry or ScheduleLatenessRegistry(
@@ -1374,6 +1543,13 @@ class PollCog(commands.Cog):
         self._deadline_tasks: dict[int, asyncio.Task] = {}
         self._lateness_tasks: dict[int, asyncio.Task] = {}
         self._lateness_reaction_tasks: dict[int, asyncio.Task] = {}
+        self._effect_config = effect_config or ScheduleEffectConfig()
+        self._effect_roll = effect_roller or (
+            lambda: random.randint(1, SCHEDULE_EFFECT_ROLL_SIDES)
+        )
+        self._effect_tasks: dict[asyncio.Task, int] = {}
+        self._normal_effect_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._effect_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._lateness_tracking_started = False
         self._registry_recovery_task: asyncio.Task | None = None
 
@@ -1422,10 +1598,14 @@ class PollCog(commands.Cog):
         deadline_tasks = list(self._deadline_tasks.values())
         lateness_tasks = list(self._lateness_tasks.values())
         lateness_reaction_tasks = list(self._lateness_reaction_tasks.values())
+        effect_tasks = list(self._effect_tasks)
         self._auto_start_tasks.clear()
         self._deadline_tasks.clear()
         self._lateness_tasks.clear()
         self._lateness_reaction_tasks.clear()
+        self._effect_tasks.clear()
+        self._normal_effect_tasks.clear()
+        self._effect_locks.clear()
         self._lateness_tracking_started = False
         self._auto_start_revisions.clear()
         self._last_cancelled_user_ids.clear()
@@ -1438,11 +1618,14 @@ class PollCog(commands.Cog):
             task.cancel()
         for task in lateness_reaction_tasks:
             task.cancel()
+        for task in effect_tasks:
+            task.cancel()
         pending_tasks = [
             *tasks,
             *deadline_tasks,
             *lateness_tasks,
             *lateness_reaction_tasks,
+            *effect_tasks,
         ]
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
@@ -3346,6 +3529,7 @@ class PollCog(commands.Cog):
             self._forget_start_notification(poll.message_id)
             self._last_cancelled_user_ids.pop(poll.message_id, None)
             self._start_notified_poll_ids.discard(poll.message_id)
+            self._clear_schedule_effect_state(poll.message_id)
         if expired_polls:
             logger.info(
                 "expired %s schedule poll registry entries older than %s days",
@@ -3368,6 +3552,7 @@ class PollCog(commands.Cog):
         self._forget_start_notification(message_id)
         self._last_cancelled_user_ids.pop(message_id, None)
         self._start_notified_poll_ids.discard(message_id)
+        self._clear_schedule_effect_state(message_id)
         if message_id not in self._persisted_schedule_ids:
             return
         try:
@@ -3375,6 +3560,23 @@ class PollCog(commands.Cog):
             self._persisted_schedule_ids.discard(message_id)
         except (sqlite3.Error, OSError):
             logger.exception("failed to unregister schedule poll %s", message_id)
+
+    def _clear_schedule_effect_state(self, message_id: int) -> None:
+        """終了した募集の一時演出タスクとロックを破棄する。"""
+        for key, task in list(self._normal_effect_tasks.items()):
+            if key[0] == message_id:
+                self._normal_effect_tasks.pop(key, None)
+                task.cancel()
+        for key in list(self._effect_locks):
+            if key[0] == message_id:
+                self._effect_locks.pop(key, None)
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        for task, task_message_id in list(self._effect_tasks.items()):
+            if task_message_id == message_id and task is not current_task:
+                task.cancel()
 
     def _queue_schedule_deadline(self, poll: RegisteredSchedulePoll) -> None:
         if poll.deadline_at is None:
@@ -4408,6 +4610,7 @@ class PollCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        self._queue_schedule_effect(payload)
         self._queue_auto_start_check(payload)
         self._queue_lateness_reaction_sync(payload)
 
@@ -4460,6 +4663,188 @@ class PollCog(commands.Cog):
                 message_id=message_id,
                 channel_id=payload.channel_id,
             )
+
+    def _queue_schedule_effect(self, payload) -> None:
+        """設定対象ユーザーの時刻リアクションを1募集1回だけ抽選する。"""
+        user_id = getattr(payload, "user_id", None)
+        message_id = getattr(payload, "message_id", None)
+        bot_user = self.bot.user
+        if (
+            not self._effect_config.enabled
+            or user_id not in self._effect_config.user_ids
+            or message_id not in self._registered_schedule_ids
+            or getattr(payload, "guild_id", None) is None
+            or bot_user is None
+            or user_id == bot_user.id
+            or str(getattr(payload, "emoji", "")) not in OPTION_EMOJIS
+        ):
+            return
+
+        key = (message_id, user_id)
+        task = asyncio.create_task(
+            self._run_schedule_effect(
+                payload,
+                key=key,
+            ),
+            name=f"schedule-effect-{message_id}-{user_id}",
+        )
+        self._effect_tasks[task] = message_id
+        task.add_done_callback(self._discard_schedule_effect_task)
+
+    def _discard_schedule_effect_task(self, task: asyncio.Task) -> None:
+        self._effect_tasks.pop(task, None)
+        for key, normal_task in list(self._normal_effect_tasks.items()):
+            if normal_task is task:
+                self._normal_effect_tasks.pop(key, None)
+
+    async def _run_schedule_effect(
+        self,
+        payload,
+        *,
+        key: tuple[int, int],
+    ) -> None:
+        message_id, user_id = key
+        try:
+            effect_lock = self._effect_locks.setdefault(key, asyncio.Lock())
+            async with effect_lock:
+                channel = self.bot.get_channel(payload.channel_id)
+                if channel is None:
+                    channel = await self.bot.fetch_channel(payload.channel_id)
+                if not hasattr(channel, "fetch_message") or not hasattr(
+                    channel,
+                    "send",
+                ):
+                    return
+                poll_message = await channel.fetch_message(message_id)
+                bot_user = self.bot.user
+                if (
+                    message_id not in self._registered_schedule_ids
+                    or bot_user is None
+                    or poll_message.author.id != bot_user.id
+                    or not poll_message.embeds
+                    or not is_auto_start_schedule(poll_message.embeds[0])
+                ):
+                    return
+
+                options = schedule_options_from_embed(poll_message.embeds[0])
+                minimum = auto_start_minimum(poll_message.embeds[0])
+                if options is None or minimum is None:
+                    return
+                option_by_emoji = dict(zip(schedule_option_emojis(options), options))
+                selected_option = option_by_emoji.get(str(payload.emoji))
+                if (
+                    selected_option is None
+                    or normalize_schedule_time(selected_option) is None
+                ):
+                    return
+
+                voters_by_option = await self._collect_schedule_voters(
+                    poll_message,
+                    options,
+                )
+                if user_id not in voters_by_option.get(selected_option, set()):
+                    return
+                start_time = choose_start_time(voters_by_option, minimum)
+                voters_before_reaction = {
+                    option: set(user_ids)
+                    for option, user_ids in voters_by_option.items()
+                }
+                voters_before_reaction[selected_option].discard(user_id)
+                start_time_before_reaction = choose_start_time(
+                    voters_before_reaction,
+                    minimum,
+                )
+                deciding_vote = (
+                    start_time is not None and start_time_before_reaction is None
+                )
+
+                new_draw, jackpot_played = (
+                    self._schedule_registry.claim_effect_draw(
+                        message_id,
+                        user_id,
+                    )
+                )
+                if jackpot_played:
+                    return
+                current_task = asyncio.current_task()
+                if deciding_vote:
+                    if not self._schedule_registry.claim_effect_jackpot(
+                        message_id,
+                        user_id,
+                    ):
+                        return
+                    normal_task = self._normal_effect_tasks.pop(key, None)
+                    if normal_task is not None and normal_task is not current_task:
+                        normal_task.cancel()
+                        await asyncio.gather(normal_task, return_exceptions=True)
+                    effect = "rush"
+                    effect_start_time = start_time
+                else:
+                    if not new_draw:
+                        return
+                    effect = schedule_effect_for_roll(self._effect_roll())
+                    if effect is None:
+                        return
+                    effect_start_time = None
+                    if current_task is not None:
+                        self._normal_effect_tasks[key] = current_task
+
+            await self._play_schedule_effect(
+                channel,
+                schedule_effect_frames(
+                    effect,
+                    user_id=user_id,
+                    start_time=effect_start_time,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.exception(
+                "failed to play schedule effect for poll %s and user %s",
+                message_id,
+                user_id,
+            )
+        except Exception:
+            logger.exception(
+                "unexpected schedule effect failure for poll %s and user %s",
+                message_id,
+                user_id,
+            )
+
+    async def _play_schedule_effect(
+        self,
+        channel,
+        frames: tuple[str, str, str],
+    ) -> None:
+        effect_message = None
+        try:
+            effect_message = await channel.send(
+                content=frames[0],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            for frame in frames[1:]:
+                await self._effect_sleep(SCHEDULE_EFFECT_STEP_SECONDS)
+                await effect_message.edit(
+                    content=frame,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            displayed_seconds = SCHEDULE_EFFECT_STEP_SECONDS * (len(frames) - 1)
+            await self._effect_sleep(
+                max(
+                    0.0,
+                    self._effect_config.delete_after_seconds - displayed_seconds,
+                )
+            )
+        finally:
+            if effect_message is not None:
+                try:
+                    await effect_message.delete()
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    logger.exception(
+                        "failed to delete temporary schedule effect message %s",
+                        effect_message.id,
+                    )
 
     async def _handle_schedule_message_delete(
         self,
@@ -4840,7 +5225,7 @@ class PollCog(commands.Cog):
             await asyncio.shield(transition_task)
         except asyncio.CancelledError:
             # Discordへの送信とfooter更新の途中で取消すと通知だけが残るため、
-            # 開始済みの状態遷移は完了させる。新しい票は次の10秒判定で補正する。
+            # 開始済みの状態遷移は完了させる。新しい票は次の8秒判定で補正する。
             try:
                 await transition_task
             except (discord.Forbidden, discord.NotFound, discord.HTTPException):
@@ -5522,4 +5907,9 @@ class PollCog(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(PollCog(bot))
+    await bot.add_cog(
+        PollCog(
+            bot,
+            effect_config=load_schedule_effect_config(),
+        )
+    )
