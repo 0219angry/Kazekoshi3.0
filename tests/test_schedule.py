@@ -24,6 +24,7 @@ from kazekoshi.cogs.poll import (
     choose_start_time,
     format_schedule_options,
     is_auto_start_schedule,
+    mark_start_time_announced,
     normalize_schedule_time,
     parse_schedule_add_options,
     parse_message_id,
@@ -31,6 +32,7 @@ from kazekoshi.cogs.poll import (
     schedule_author_id,
     schedule_option_emojis,
     schedule_options_from_embed,
+    set_auto_start_minimum,
     start_announcement,
 )
 
@@ -414,6 +416,27 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertFalse(is_auto_start_schedule(markerless_embed))
         self.assertFalse(is_auto_start_schedule(non_time_embed))
 
+    def test_minimum_update_preserves_active_announcement(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(
+            role,
+            ["15:00", "16:00", "17:00", "NG"],
+            author,
+            auto_start=True,
+        )
+        mark_start_time_announced(embed, "16:00", 123456)
+
+        self.assertTrue(set_auto_start_minimum(embed, 3))
+
+        self.assertEqual(auto_start_minimum(embed), 3)
+        self.assertEqual(embed.title, "📅 VALORANT 開始時間 [3人]")
+        announcement = start_announcement(embed)
+        self.assertEqual(announcement.start_time, "16:00")
+        self.assertEqual(announcement.message_id, 123456)
+        self.assertIn("初回通知済み", embed.footer.text)
+        self.assertFalse(set_auto_start_minimum(embed, 3))
+
     def test_legacy_multiline_options_remain_readable(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
@@ -446,7 +469,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         application_commands = PollCog.schedule.app_command.commands
         self.assertEqual(
             [command.name for command in application_commands],
-            ["add", "update", "close"],
+            ["add", "minimum", "update", "close"],
         )
         add_command = application_commands[0]
         options_parameter = next(
@@ -503,7 +526,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(schedule_group)
             self.assertEqual(
                 [command.name for command in schedule_group.commands],
-                ["add", "update", "close"],
+                ["add", "minimum", "update", "close"],
             )
         finally:
             await bot.close()
@@ -696,6 +719,28 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         ctx.send.assert_awaited_once()
         self.assertIn("リアクションの追加", ctx.send.await_args.args[0])
         self.assertNotIn("embed", ctx.send.await_args.kwargs)
+
+    async def test_minimum_rejects_out_of_range_before_fetching_poll(self):
+        cog = PollCog(SimpleNamespace(), registry=self.registry)
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(),
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        for minimum in (0, 1000):
+            with self.subTest(minimum=minimum):
+                ctx.send.reset_mock()
+                await PollCog.schedule_minimum.callback(
+                    cog,
+                    ctx,
+                    "99",
+                    minimum,
+                )
+                self.assertIn("1〜999人", ctx.send.await_args.args[0])
+
+        ctx.defer.assert_not_awaited()
 
     async def test_update_edits_embed_and_resets_reactions(self):
         bot_user = SimpleNamespace(id=1)
@@ -2012,6 +2057,49 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("作成者", ctx.send.await_args.args[0])
         await self.finish_check(sleep_call, pending_task)
         self.harness.channel.send.assert_awaited_once()
+
+    async def test_schedule_minimum_keeps_votes_and_rechecks(self):
+        permissions = SimpleNamespace(
+            manage_messages=True,
+            read_message_history=True,
+            embed_links=True,
+        )
+        self.harness.channel.permissions_for = lambda _: permissions
+        self.harness.set_voters({"20:00": {2, 3, 4}})
+        original_reactions = list(self.harness.poll_message.reactions)
+        ctx = SimpleNamespace(
+            bot=self.harness.bot,
+            guild=SimpleNamespace(id=1, me=self.harness.bot_user),
+            channel=self.harness.channel,
+            author=self.harness.creator,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_minimum.callback(
+            self.harness.cog,
+            ctx,
+            str(self.harness.POLL_MESSAGE_ID),
+            3,
+        )
+
+        embed = self.harness.poll_message.embeds[0]
+        self.assertEqual(auto_start_minimum(embed), 3)
+        self.assertEqual(embed.title, "📅 GAME 開始時間 [3人]")
+        self.assertEqual(self.harness.poll_message.reactions, original_reactions)
+        self.assertIn("最低人数を3人", ctx.send.await_args.args[0])
+
+        await self.sleeper.wait_for_calls(1)
+        pending_task = self.harness.cog._auto_start_tasks[
+            self.harness.POLL_MESSAGE_ID
+        ]
+        await self.finish_check(self.sleeper.calls[0], pending_task)
+
+        self.assertEqual(
+            self.harness.channel.send.await_args.kwargs["content"],
+            "20:00 開始 <@&88>",
+        )
 
     async def test_schedule_close_disables_poll_and_cancels_active_notification(self):
         old_notification = await self.announce(

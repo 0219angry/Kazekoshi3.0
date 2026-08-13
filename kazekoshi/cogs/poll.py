@@ -425,6 +425,31 @@ def set_schedule_title_minimum(
     embed.title = title + closed_suffix
 
 
+def set_auto_start_minimum(
+    embed: discord.Embed,
+    minimum: int,
+) -> bool:
+    """通知状態を保ったまま、自動開始の最低人数とタイトルを更新する。"""
+    if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+        raise ValueError("auto-start minimum is out of range")
+    footer_text = embed.footer.text or ""
+    marker_match = AUTO_START_FOOTER_PATTERN.search(footer_text)
+    if marker_match is None:
+        return False
+
+    minimum_start, minimum_end = marker_match.span("minimum")
+    updated_footer = (
+        footer_text[:minimum_start]
+        + str(minimum)
+        + footer_text[minimum_end:]
+    )
+    original_title = embed.title
+    if updated_footer != footer_text:
+        embed.set_footer(text=updated_footer)
+    set_schedule_title_minimum(embed, minimum)
+    return updated_footer != footer_text or embed.title != original_title
+
+
 def set_auto_start_marker(
     embed: discord.Embed,
     *,
@@ -718,6 +743,7 @@ class PollCog(commands.Cog):
             "📅 開始時間投票コマンド\n"
             f"作成: `{prefix}schedule add @ロール [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
+            f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
         )
@@ -874,6 +900,127 @@ class PollCog(commands.Cog):
             ctx.author,
             poll_message.id,
             role.id,
+            minimum,
+        )
+
+    @schedule.command(
+        name="minimum",
+        description="開始時間投票の自動判定人数を変更します",
+    )
+    @app_commands.describe(
+        message="変更する開始時間投票の投稿IDまたはリンク",
+        minimum="自動開始と判定する最低人数（1〜999人）",
+    )
+    @commands.guild_only()
+    async def schedule_minimum(
+        self,
+        ctx: commands.Context,
+        message: str,
+        minimum: int,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+            await self._send_notice(
+                ctx,
+                f"❌ 最低人数は{AUTO_START_MINIMUM_MIN}〜{AUTO_START_MINIMUM_MAX}人で指定してください",
+            )
+            return
+        try:
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        missing_permissions = [
+            name
+            for name, enabled in {
+                "メッセージ履歴を読む": bot_permissions.read_message_history,
+                "埋め込みリンク": bot_permissions.embed_links,
+            }.items()
+            if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            await self._change_schedule_minimum(ctx, message_id, minimum)
+
+    async def _change_schedule_minimum(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+        minimum: int,
+    ) -> None:
+        poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+
+        original_embed = poll_message.embeds[0]
+        if not is_auto_start_schedule(original_embed):
+            await self._send_notice(
+                ctx,
+                "❌ 自動開始判定が有効な開始時間投票を指定してください",
+            )
+            return
+
+        updated_embed = original_embed.copy()
+        changed = set_auto_start_minimum(updated_embed, minimum)
+        if not changed:
+            await self._send_notice(
+                ctx,
+                f"ℹ️ 最低人数はすでに{minimum}人です\n{poll_message.jump_url}",
+            )
+            return
+
+        self._invalidate_auto_start_check(message_id)
+        try:
+            await poll_message.edit(embed=updated_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "failed to change schedule poll minimum %s",
+                message_id,
+            )
+            self._resume_auto_start_check(ctx, poll_message)
+            await self._send_notice(ctx, "❌ 最低人数を変更できませんでした")
+            return
+
+        guild_id = getattr(ctx.guild, "id", None)
+        if guild_id is not None:
+            self._register_schedule_poll(
+                guild_id=guild_id,
+                channel_id=ctx.channel.id,
+                message_id=poll_message.id,
+            )
+            if getattr(self.bot, "user", None) is not None:
+                self._queue_auto_start_check_by_id(
+                    guild_id=guild_id,
+                    channel_id=ctx.channel.id,
+                    message_id=poll_message.id,
+                )
+
+        await self._send_notice(
+            ctx,
+            f"✅ 最低人数を{minimum}人に変更しました\n{poll_message.jump_url}",
+        )
+        logger.info(
+            "%s changed schedule poll %s minimum to %s",
+            ctx.author,
+            message_id,
             minimum,
         )
 
@@ -2162,6 +2309,22 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_minimum.error
+    async def schedule_minimum_error(self, ctx, error):
+        if isinstance(
+            error,
+            (commands.MissingRequiredArgument, commands.BadArgument),
+        ):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule minimum <投稿IDまたはリンク> <1〜999>`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
