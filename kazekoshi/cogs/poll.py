@@ -19,6 +19,7 @@ logger = getLogger(__name__)
 EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 EMOJI_NG = "🆖"
 SCHEDULE_TITLE_PREFIX = "📅 "
+SCHEDULE_TITLE_MINIMUM_PATTERN = re.compile(r"\s+\[[1-9]\d{0,2}人\]$")
 SCHEDULE_FOOTER_PATTERN = re.compile(r"\|\s*作成者ID:\s*(\d+)\s*$")
 MESSAGE_LINK_PATTERN = re.compile(
     r"https?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/"
@@ -402,6 +403,23 @@ def remove_auto_start_marker(embed: discord.Embed) -> None:
         embed.set_footer(text=updated_footer)
 
 
+def set_schedule_title_minimum(
+    embed: discord.Embed,
+    minimum: int | None,
+) -> None:
+    """開始時間の直後に、自動判定の最低人数を表示する。"""
+    if not embed.title or not embed.title.startswith(SCHEDULE_TITLE_PREFIX):
+        return
+    closed_suffix = "（終了）" if embed.title.endswith("（終了）") else ""
+    title = embed.title[:-len(closed_suffix)] if closed_suffix else embed.title
+    title = SCHEDULE_TITLE_MINIMUM_PATTERN.sub("", title)
+    if minimum is not None:
+        if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+            raise ValueError("auto-start minimum is out of range")
+        title += f" [{minimum}人]"
+    embed.title = title + closed_suffix
+
+
 def set_auto_start_marker(
     embed: discord.Embed,
     *,
@@ -411,6 +429,7 @@ def set_auto_start_marker(
     """既存状態を消したうえで、自動開始判定マーカーを設定し直す。"""
     remove_auto_start_marker(embed)
     if not enabled:
+        set_schedule_title_minimum(embed, None)
         return
     if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
         raise ValueError("auto-start minimum is out of range")
@@ -418,6 +437,7 @@ def set_auto_start_marker(
     suffix_match = CREATOR_ID_SUFFIX_PATTERN.search(footer_text)
     if suffix_match is None:
         return
+    set_schedule_title_minimum(embed, minimum)
     embed.set_footer(
         text=(
             footer_text[:suffix_match.start()]
@@ -555,15 +575,20 @@ def build_schedule_embed(
     auto_start: bool = False,
     minimum: int = AUTO_START_THRESHOLD,
 ) -> discord.Embed:
+    if (
+        auto_start
+        and not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX
+    ):
+        raise ValueError("auto-start minimum is out of range")
     embed = discord.Embed(
         title=f"{SCHEDULE_TITLE_PREFIX}{role.name} 開始時間",
         description=format_schedule_options(options),
         color=discord.Color.blue(),
     )
+    if auto_start:
+        set_schedule_title_minimum(embed, minimum)
     footer_parts = [f"作成者: {author.display_name}", "複数選択可"]
     if auto_start:
-        if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
-            raise ValueError("auto-start minimum is out of range")
         footer_parts.append(f"{minimum}人で自動開始判定")
     footer_parts.append(f"作成者ID: {author.id}")
     embed.set_footer(text=" | ".join(footer_parts))

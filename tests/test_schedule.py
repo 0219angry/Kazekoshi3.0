@@ -386,6 +386,7 @@ class ScheduleDisplayTests(unittest.TestCase):
 
         self.assertTrue(is_auto_start_schedule(time_embed))
         self.assertEqual(auto_start_minimum(time_embed), 5)
+        self.assertEqual(time_embed.title, "📅 VALORANT 開始時間 [5人]")
         self.assertEqual(
             time_embed.description,
             "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
@@ -533,7 +534,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         sent = ctx.send.await_args.kwargs
         self.assertEqual(sent["content"], "<@&88>")
         self.assertEqual(sent["allowed_mentions"].roles, [role])
-        self.assertEqual(sent["embed"].title, "📅 RAID 開始時間")
+        self.assertEqual(sent["embed"].title, "📅 RAID 開始時間 [5人]")
         self.assertTrue(is_auto_start_schedule(sent["embed"]))
         self.assertEqual(
             sent["embed"].description,
@@ -570,6 +571,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         custom_embed = ctx.send.await_args.kwargs["embed"]
         self.assertTrue(is_auto_start_schedule(custom_embed))
         self.assertEqual(auto_start_minimum(custom_embed), 3)
+        self.assertEqual(custom_embed.title, "📅 RAID 開始時間 [3人]")
         self.assertEqual(
             custom_embed.description,
             "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
@@ -755,6 +757,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(is_auto_start_schedule(edited_embed))
         self.assertEqual(auto_start_minimum(edited_embed), 3)
+        self.assertEqual(edited_embed.title, "📅 VALORANT 開始時間 [3人]")
         self.assertIsNone(announced_start_time(edited_embed))
         self.assertEqual(
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
@@ -1944,6 +1947,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.harness.channel.send.assert_not_awaited()
         self.assertFalse(is_auto_start_schedule(self.harness.poll_message.embeds[0]))
+        self.assertEqual(
+            self.harness.poll_message.embeds[0].title,
+            "📅 GAME 開始時間",
+        )
         self.assertIn("投票をリセット", ctx.send.await_args.args[0])
 
     async def test_rejected_update_does_not_cancel_pending_notification(self):
@@ -2016,7 +2023,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         embed = self.harness.poll_message.embeds[0]
         self.assertFalse(is_auto_start_schedule(embed))
-        self.assertTrue(embed.title.endswith("（終了）"))
+        self.assertEqual(embed.title, "📅 GAME 開始時間 [5人]（終了）")
         self.assertIn("投票終了", embed.footer.text)
         self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("投票が終了", old_notification.content)
