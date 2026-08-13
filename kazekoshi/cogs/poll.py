@@ -62,7 +62,7 @@ AUTO_START_NOTICE_RETRY_DELAY_SECONDS = 2
 SCHEDULE_RETENTION_DAYS = 90
 SCHEDULE_REGISTRY_PATH = Path("json/schedule_polls.sqlite3")
 AUTO_START_MINIMUM_MARKER_PATTERN = (
-    rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で自動開始判定"
+    rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
 AUTO_START_MINIMUM_PATTERN = re.compile(AUTO_START_MINIMUM_MARKER_PATTERN)
 AUTO_START_MINIMUM_SUFFIX_PATTERN = re.compile(
@@ -471,7 +471,7 @@ def set_auto_start_marker(
     embed.set_footer(
         text=(
             footer_text[:suffix_match.start()]
-            + f" | {minimum}人で自動開始判定"
+            + f" | {minimum}人で開始判定"
             + suffix_match.group(0)
         )
     )
@@ -619,7 +619,7 @@ def build_schedule_embed(
         set_schedule_title_minimum(embed, minimum)
     footer_parts = [f"作成者: {author.display_name}", "複数選択可"]
     if auto_start:
-        footer_parts.append(f"{minimum}人で自動開始判定")
+        footer_parts.append(f"{minimum}人で開始判定")
     footer_parts.append(f"作成者ID: {author.id}")
     embed.set_footer(text=" | ".join(footer_parts))
     return embed

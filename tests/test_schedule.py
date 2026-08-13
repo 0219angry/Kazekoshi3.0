@@ -437,6 +437,22 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertIn("初回通知済み", embed.footer.text)
         self.assertFalse(set_auto_start_minimum(embed, 3))
 
+    def test_legacy_auto_start_footer_remains_readable(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(
+            role,
+            ["15:00", "16:00", "NG"],
+            author,
+            auto_start=True,
+        )
+        embed.set_footer(
+            text=embed.footer.text.replace("人で開始判定", "人で自動開始判定")
+        )
+
+        self.assertTrue(is_auto_start_schedule(embed))
+        self.assertEqual(auto_start_minimum(embed), 5)
+
     def test_legacy_multiline_options_remain_readable(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
