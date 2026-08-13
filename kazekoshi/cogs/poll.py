@@ -17,6 +17,7 @@ from discord.ext import commands
 
 logger = getLogger(__name__)
 EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+EMOJI_NG = "🆖"
 SCHEDULE_CHANNEL_NAME = "valorant"
 SCHEDULE_TITLE_PREFIX = "📅 "
 SCHEDULE_FOOTER_PATTERN = re.compile(r"\|\s*作成者ID:\s*(\d+)\s*$")
@@ -28,12 +29,24 @@ ROLE_MENTION_PATTERN = re.compile(r"<@&(\d+)>")
 MIN_SCHEDULE_OPTIONS = 2
 MAX_SCHEDULE_OPTIONS = len(EMOJI_NUMBERS)
 MAX_SCHEDULE_OPTION_LENGTH = 100
-DEFAULT_SCHEDULE_OPTION_LIST = ("20", "21", "22", "23", "24", "ng")
+DEFAULT_SCHEDULE_OPTION_LIST = (
+    "20:00",
+    "20:30",
+    "21:00",
+    "21:30",
+    "22:00",
+    "22:30",
+    "23:00",
+    "24:00",
+    "NG",
+)
 DEFAULT_SCHEDULE_OPTIONS = " ".join(DEFAULT_SCHEDULE_OPTION_LIST)
 DEFAULT_TIME_OPTIONS = DEFAULT_SCHEDULE_OPTION_LIST[:-1]
 DEFAULT_TIME_EMOJIS = tuple(EMOJI_NUMBERS[:len(DEFAULT_TIME_OPTIONS)])
-DEFAULT_SCHEDULE_EMOJIS = tuple(
-    EMOJI_NUMBERS[:len(DEFAULT_SCHEDULE_OPTION_LIST)]
+DEFAULT_SCHEDULE_EMOJIS = DEFAULT_TIME_EMOJIS + (EMOJI_NG,)
+SCHEDULE_REACTION_EMOJIS = tuple(EMOJI_NUMBERS) + (EMOJI_NG,)
+SCHEDULE_ENTRY_PATTERN = re.compile(
+    rf"(?:^|, )(?P<emoji>{'|'.join(re.escape(emoji) for emoji in SCHEDULE_REACTION_EMOJIS)})"
 )
 AUTO_START_THRESHOLD = 5
 AUTO_START_GRACE_SECONDS = 10
@@ -46,28 +59,29 @@ AUTO_START_NOTIFIED_MARKER = "初回通知済み"
 AUTO_START_ANNOUNCED_LABEL = "開始通知済み"
 AUTO_START_MESSAGE_ID_LABEL = "通知ID"
 SCHEDULE_CLOSED_MARKER = "投票終了"
+AUTO_START_TIME_PATTERN = r"[^|]+?"
 AUTO_START_FOOTER_PATTERN = re.compile(
     rf"\|\s*複数選択可\s*\|\s*{AUTO_START_FOOTER_MARKER}\s*"
     rf"(?:\|\s*{AUTO_START_NOTIFIED_MARKER}\s*)?"
-    rf"(?:\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*\d+\s*"
+    rf"(?:\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*{AUTO_START_TIME_PATTERN}\s*"
     rf"(?:\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*\d+\s*)?)?"
     r"\|\s*作成者ID:\s*\d+\s*$"
 )
 AUTO_START_MARKER_REMOVAL_PATTERN = re.compile(
     rf"\s*\|\s*{AUTO_START_FOOTER_MARKER}"
     rf"(?:\s*\|\s*{AUTO_START_NOTIFIED_MARKER})?"
-    rf"(?:\s*\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*\d+"
+    rf"(?:\s*\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*{AUTO_START_TIME_PATTERN}"
     rf"(?:\s*\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*\d+)?)?"
     r"(?=\s*\|\s*作成者ID:\s*\d+\s*$)"
 )
 AUTO_START_STATE_PATTERN = re.compile(
-    rf"\s*\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*(?P<start_time>\d+)\s*"
+    rf"\s*\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*(?P<start_time>{AUTO_START_TIME_PATTERN})\s*"
     rf"(?:\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*(?P<message_id>\d+)\s*)?"
     r"(?=\|\s*作成者ID:\s*\d+\s*$)"
 )
 AUTO_START_NOTIFIED_PATTERN = re.compile(
     rf"\|\s*{AUTO_START_NOTIFIED_MARKER}\s*"
-    rf"(?=(?:\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*\d+\s*"
+    rf"(?=(?:\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*{AUTO_START_TIME_PATTERN}\s*"
     rf"(?:\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*\d+\s*)?)?"
     r"\|\s*作成者ID:\s*\d+\s*$)"
 )
@@ -173,13 +187,141 @@ def parse_schedule_options(value: str) -> list[str]:
         raise ScheduleInputError(
             f"候補は1つにつき{MAX_SCHEDULE_OPTION_LENGTH}文字以内にしてください"
         )
-    return options
+    normalized_options = normalize_auto_start_options(options)
+    return normalized_options if normalized_options is not None else options
+
+
+def normalize_schedule_time(value: str) -> str | None:
+    """対応する時刻表記を、自動判定・通知用の HH:MM 形式へそろえる。"""
+    value = value.strip()
+    if re.fullmatch(r"[0-9]{1,2}", value):
+        hour = int(value)
+        minute = 0
+    elif match := re.fullmatch(
+        r"(?P<hour>[0-9]{1,2}):(?P<minute>[0-9]{2})",
+        value,
+    ):
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+    elif re.fullmatch(r"[0-9]{4}", value):
+        hour = int(value[:2])
+        minute = int(value[2:])
+    else:
+        return None
+
+    if hour > 24 or minute > 59 or (hour == 24 and minute != 0):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def normalize_auto_start_options(options: list[str]) -> list[str] | None:
+    """全候補が時刻（末尾のNGを除く）なら表示用にも正規化する。"""
+    if not options:
+        return None
+
+    has_ng = options[-1].casefold() == "ng"
+    time_options = options[:-1] if has_ng else options
+    if not time_options:
+        return None
+
+    normalized_times: list[str] = []
+    seen_times: set[str] = set()
+    for option in time_options:
+        normalized_time = normalize_schedule_time(option)
+        if normalized_time is None or normalized_time in seen_times:
+            return None
+        normalized_times.append(normalized_time)
+        seen_times.add(normalized_time)
+
+    if has_ng:
+        normalized_times.append("NG")
+    return normalized_times
 
 
 def format_schedule_options(options: list[str]) -> str:
-    return "\n".join(
-        f"{EMOJI_NUMBERS[index]}：{option}" for index, option in enumerate(options)
+    emojis = schedule_option_emojis(options)
+    return ", ".join(
+        f"{emoji}{option}" for emoji, option in zip(emojis, options)
     )
+
+
+def schedule_option_emojis(options: list[str]) -> list[str]:
+    emojis: list[str] = []
+    last_index = len(options) - 1
+    for index, option in enumerate(options):
+        if option.casefold() == "ng" and index == last_index:
+            emojis.append(EMOJI_NG)
+            continue
+        emojis.append(EMOJI_NUMBERS[index])
+    return emojis
+
+
+def format_start_label(start_time: str) -> str:
+    normalized_time = normalize_schedule_time(start_time)
+    return f"{normalized_time or start_time} 開始"
+
+
+def schedule_options_from_embed(embed: discord.Embed) -> list[str] | None:
+    """Botが生成した投票の説明欄から、リアクション順の候補を復元する。"""
+    description = embed.description
+    if not description:
+        return None
+
+    # 現行の「1️⃣20:00, 2️⃣20:30」形式を読み取る。
+    options: list[str] = []
+    actual_emojis: list[str] = []
+    matches = list(SCHEDULE_ENTRY_PATTERN.finditer(description))
+    if matches and matches[0].start() == 0:
+        for index, match in enumerate(matches):
+            option_end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(description)
+            )
+            option = description[match.end():option_end]
+            if not option:
+                break
+            actual_emojis.append(match.group("emoji"))
+            options.append(option)
+
+    # 投稿済み投票との互換性のため、旧来の改行・全角コロン形式も読む。
+    if not _valid_schedule_option_emojis(options, actual_emojis):
+        options = []
+        actual_emojis = []
+        for line in description.splitlines():
+            emoji, separator, option = line.partition("：")
+            if not separator or not option:
+                return None
+            actual_emojis.append(emoji)
+            options.append(option)
+
+    if not _valid_schedule_option_emojis(options, actual_emojis):
+        return None
+    return options
+
+
+def _valid_schedule_option_emojis(
+    options: list[str],
+    actual_emojis: list[str],
+) -> bool:
+    if (
+        not MIN_SCHEDULE_OPTIONS <= len(options) <= MAX_SCHEDULE_OPTIONS
+        or len(actual_emojis) != len(options)
+    ):
+        return False
+    expected_emojis = schedule_option_emojis(options)
+    for index, (actual, expected) in enumerate(
+        zip(actual_emojis, expected_emojis)
+    ):
+        # 既存投票では末尾のngに番号リアクションを使っていたため読み替える。
+        is_legacy_ng = (
+            index == len(options) - 1
+            and options[index].casefold() == "ng"
+            and actual == EMOJI_NUMBERS[index]
+        )
+        if actual != expected and not is_legacy_ng:
+            return False
+    return True
 
 
 def parse_message_id(value: str) -> tuple[int, int | None]:
@@ -203,11 +345,12 @@ def schedule_author_id(embed: discord.Embed) -> int | None:
 
 
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
-    expected_description = format_schedule_options(list(DEFAULT_SCHEDULE_OPTION_LIST))
     footer_text = embed.footer.text or ""
+    options = schedule_options_from_embed(embed)
     return (
-        embed.description == expected_description
-        and AUTO_START_FOOTER_PATTERN.search(footer_text) is not None
+        AUTO_START_FOOTER_PATTERN.search(footer_text) is not None
+        and options is not None
+        and normalize_auto_start_options(options) is not None
     )
 
 
@@ -221,6 +364,24 @@ def remove_auto_start_marker(embed: discord.Embed) -> None:
     )
     if updated_footer != footer_text:
         embed.set_footer(text=updated_footer)
+
+
+def set_auto_start_marker(embed: discord.Embed, *, enabled: bool) -> None:
+    """既存状態を消したうえで、自動開始判定マーカーを設定し直す。"""
+    remove_auto_start_marker(embed)
+    if not enabled:
+        return
+    footer_text = embed.footer.text or ""
+    suffix_match = CREATOR_ID_SUFFIX_PATTERN.search(footer_text)
+    if suffix_match is None:
+        return
+    embed.set_footer(
+        text=(
+            footer_text[:suffix_match.start()]
+            + f" | {AUTO_START_FOOTER_MARKER}"
+            + suffix_match.group(0)
+        )
+    )
 
 
 def mark_schedule_closed(embed: discord.Embed) -> None:
@@ -244,8 +405,9 @@ def start_announcement(embed: discord.Embed) -> StartAnnouncement | None:
     if match is None:
         return None
     message_id = match.group("message_id")
+    stored_start_time = match.group("start_time").strip()
     return StartAnnouncement(
-        start_time=match.group("start_time"),
+        start_time=normalize_schedule_time(stored_start_time) or stored_start_time,
         message_id=int(message_id) if message_id is not None else None,
     )
 
@@ -316,12 +478,23 @@ def mark_start_time_announced(
 
 
 def choose_start_time(voters_by_option: dict[str, set[int]]) -> str | None:
-    """20時側から重複を除いて集計し、5人目が加わる開始時刻を返す。"""
+    """早い時刻側から重複を除いて集計し、5人目が加わる時刻を返す。"""
+    voters_by_time: dict[int, set[int]] = {}
+    labels_by_time: dict[int, str] = {}
+    for option, voters in voters_by_option.items():
+        normalized_time = normalize_schedule_time(option)
+        if normalized_time is None:
+            continue
+        hour, minute = (int(part) for part in normalized_time.split(":"))
+        time_key = hour * 60 + minute
+        voters_by_time.setdefault(time_key, set()).update(voters)
+        labels_by_time[time_key] = normalized_time
+
     distinct_voters: set[int] = set()
-    for option in DEFAULT_TIME_OPTIONS:
-        distinct_voters.update(voters_by_option.get(option, set()))
+    for time_key in sorted(voters_by_time):
+        distinct_voters.update(voters_by_time[time_key])
         if len(distinct_voters) >= AUTO_START_THRESHOLD:
-            return option
+            return labels_by_time[time_key]
     return None
 
 
@@ -481,7 +654,7 @@ class PollCog(commands.Cog):
             "📅 開始時間投票コマンド\n"
             f"作成: `{prefix}schedule add @VALORANT [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`\n"
-            f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21 22 24 ng`\n"
+            f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
         )
 
@@ -495,7 +668,7 @@ class PollCog(commands.Cog):
     @schedule.command(name="add", description="新しい開始時間投票を作成します")
     @app_commands.describe(
         role="開始時間調整の対象ロール",
-        options="空白区切りの候補（省略時: 20 21 22 23 24 ng）",
+        options=f"空白区切りの候補（省略時: {DEFAULT_SCHEDULE_OPTIONS}）",
     )
     @commands.guild_only()
     async def schedule_add(
@@ -511,7 +684,6 @@ class PollCog(commands.Cog):
         # 新規投票の作成を、古いSQLite登録を整理する機会として利用する。
         self._prune_expired_schedule_polls()
 
-        uses_default_options = options is None
         try:
             option_list = parse_schedule_options(
                 DEFAULT_SCHEDULE_OPTIONS if options is None else options
@@ -519,6 +691,7 @@ class PollCog(commands.Cog):
         except ScheduleInputError as error:
             await self._send_notice(ctx, f"❌ {error}")
             return
+        auto_start_enabled = normalize_auto_start_options(option_list) is not None
 
         if role.is_default():
             await self._send_notice(ctx, "❌ @everyone は日程調整の対象にできません")
@@ -568,7 +741,7 @@ class PollCog(commands.Cog):
                     "❌ メンション不可のロールを指定する権限がありません",
                 )
                 return
-            if ctx.interaction is not None or uses_default_options:
+            if ctx.interaction is not None or auto_start_enabled:
                 if not bot_permissions.mention_everyone:
                     await self._send_notice(
                         ctx,
@@ -580,7 +753,7 @@ class PollCog(commands.Cog):
             role,
             option_list,
             ctx.author,
-            auto_start=uses_default_options,
+            auto_start=auto_start_enabled,
         )
         # Prefixコマンドでは元の投稿が既にロールへ通知するため、二重通知を避ける。
         allowed_roles = [role] if ctx.interaction is not None else False
@@ -598,17 +771,17 @@ class PollCog(commands.Cog):
                 embed=embed,
                 allowed_mentions=allowed_mentions,
             )
-            if uses_default_options:
+            if auto_start_enabled:
                 self._register_schedule_poll(
                     guild_id=ctx.guild.id,
                     channel_id=ctx.channel.id,
                     message_id=poll_message.id,
                 )
-            await self._add_number_reactions(poll_message, len(option_list))
+            await self._add_schedule_reactions(poll_message, option_list)
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("failed to create schedule poll")
             if poll_message is not None:
-                if uses_default_options:
+                if auto_start_enabled:
                     self._unregister_schedule_poll(poll_message.id)
                 try:
                     await poll_message.delete()
@@ -623,7 +796,7 @@ class PollCog(commands.Cog):
             )
             return
 
-        if uses_default_options and getattr(self.bot, "user", None) is not None:
+        if auto_start_enabled and getattr(self.bot, "user", None) is not None:
             self._queue_auto_start_check_by_id(
                 guild_id=ctx.guild.id,
                 channel_id=ctx.channel.id,
@@ -640,7 +813,7 @@ class PollCog(commands.Cog):
     @schedule.command(name="update", description="既存の開始時間投票を更新します")
     @app_commands.describe(
         message="更新する開始時間投票の投稿IDまたはリンク",
-        options="新しい候補（例: 21 22 24 ng）。更新時に投票はリセットされます",
+        options="新しい候補（例: 21:00 22:00 24:00 NG）。更新時に投票はリセットされます",
     )
     @commands.guild_only()
     async def schedule_update(
@@ -703,10 +876,10 @@ class PollCog(commands.Cog):
         self._invalidate_auto_start_check(message_id)
         original_embed = poll_message.embeds[0]
         active_announcement = start_announcement(original_embed)
+        auto_start_enabled = normalize_auto_start_options(option_list) is not None
         updated_embed = original_embed.copy()
         updated_embed.description = format_schedule_options(option_list)
-        # update で指定した候補はカスタム扱いにし、自動開始判定を解除する。
-        remove_auto_start_marker(updated_embed)
+        set_auto_start_marker(updated_embed, enabled=auto_start_enabled)
         try:
             await poll_message.edit(embed=updated_embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -730,7 +903,7 @@ class PollCog(commands.Cog):
                 if notification is not None:
                     await notification.edit(
                         content=(
-                            f"~~{active_announcement.start_time}時開始 {role_mention}~~\n"
+                            f"~~{format_start_label(active_announcement.start_time)} {role_mention}~~\n"
                             "↩️ 投票が更新されたため、この開始通知は取り消されました。"
                         ),
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -753,16 +926,30 @@ class PollCog(commands.Cog):
         self._unregister_schedule_poll(message_id)
 
         try:
-            await self._reset_number_reactions(poll_message, len(option_list))
+            await self._reset_schedule_reactions(poll_message, option_list)
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("failed to reset schedule poll reactions %s", message_id)
             await self._send_notice(
                 ctx,
-                "⚠️ 候補は更新しましたが、番号リアクションの再設定に失敗しました。"
+                "⚠️ 候補は更新しましたが、リアクションの再設定に失敗しました。"
                 "権限を確認して同じ内容でもう一度 update してください\n"
                 f"{poll_message.jump_url}",
             )
             return
+
+        guild_id = getattr(ctx.guild, "id", None)
+        if auto_start_enabled and guild_id is not None:
+            self._register_schedule_poll(
+                guild_id=guild_id,
+                channel_id=ctx.channel.id,
+                message_id=poll_message.id,
+            )
+            if getattr(self.bot, "user", None) is not None:
+                self._queue_auto_start_check_by_id(
+                    guild_id=guild_id,
+                    channel_id=ctx.channel.id,
+                    message_id=poll_message.id,
+                )
 
         await self._send_notice(
             ctx,
@@ -846,7 +1033,7 @@ class PollCog(commands.Cog):
                     if notification is not None:
                         await notification.edit(
                             content=(
-                                f"~~{active_announcement.start_time}時開始 "
+                                f"~~{format_start_label(active_announcement.start_time)} "
                                 f"{role_mention}~~\n"
                                 "↩️ 投票が終了したため、この開始通知は取り消されました。"
                             ),
@@ -1038,9 +1225,9 @@ class PollCog(commands.Cog):
         self,
         payload: discord.RawReactionClearEmojiEvent,
     ):
-        if str(payload.emoji) not in DEFAULT_SCHEDULE_EMOJIS:
+        if str(payload.emoji) not in SCHEDULE_REACTION_EMOJIS:
             return
-        # ng自体は集計しないが、消された投票UIを復元するため再評価する。
+        # NG自体は集計しないが、消された投票UIを復元するため再評価する。
         self._queue_auto_start_check(
             payload,
             check_emoji=False,
@@ -1165,7 +1352,7 @@ class PollCog(commands.Cog):
             or getattr(payload, "user_id", None) == bot_user.id
             or (
                 check_emoji
-                and str(getattr(payload, "emoji", "")) not in DEFAULT_TIME_EMOJIS
+                and str(getattr(payload, "emoji", "")) not in EMOJI_NUMBERS
             )
         ):
             return
@@ -1365,8 +1552,16 @@ class PollCog(commands.Cog):
             message_id=message_id,
         )
 
-        await self._ensure_default_number_reactions(poll_message)
-        voters_by_option = await self._collect_default_schedule_voters(poll_message)
+        options = schedule_options_from_embed(poll_message.embeds[0])
+        if options is None or normalize_auto_start_options(options) is None:
+            self._unregister_schedule_poll(message_id)
+            return
+
+        await self._ensure_schedule_reactions(poll_message, options)
+        voters_by_option = await self._collect_schedule_voters(
+            poll_message,
+            options,
+        )
         if self._auto_start_revisions.get(message_id) != revision:
             return
 
@@ -1453,13 +1648,13 @@ class PollCog(commands.Cog):
 
         if announcement is not None and old_notification is not None:
             replacement = (
-                f"\n↪️ 投票内容が変わり、{new_start_time}時開始へ変更されました。"
+                f"\n↪️ 投票内容が変わり、{format_start_label(new_start_time)}へ変更されました。"
                 if new_start_time is not None
                 else "\n↩️ 投票内容が変わったため、この開始通知は取り消されました。"
             )
             await old_notification.edit(
                 content=(
-                    f"~~{announcement.start_time}時開始 {role_mention}~~"
+                    f"~~{format_start_label(announcement.start_time)} {role_mention}~~"
                     f"{replacement}"
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -1515,7 +1710,7 @@ class PollCog(commands.Cog):
                 cancellation_notice = await self._send_cancellation_notice(
                     channel,
                     content=(
-                        f"↩️ {announcement.start_time}時開始の通知を取り消しました "
+                        f"↩️ {format_start_label(announcement.start_time)}の通知を取り消しました "
                         f"{role_mention}\n"
                         f"{cancellation_detail}"
                     ),
@@ -1561,9 +1756,9 @@ class PollCog(commands.Cog):
         if role is None and not already_notified:
             return
 
-        content = f"{new_start_time}時開始 {role_mention}"
+        content = f"{format_start_label(new_start_time)} {role_mention}"
         if announcement is not None and not missing_current_notification:
-            content += f"\n🔄 {announcement.start_time}時開始から変更されました。"
+            content += f"\n🔄 {format_start_label(announcement.start_time)}から変更されました。"
         allowed_mentions = (
             discord.AllowedMentions.none()
             if already_notified
@@ -1694,7 +1889,7 @@ class PollCog(commands.Cog):
             raise
 
         logger.info(
-            "schedule poll %s reached %s unique voters; announced %s:00",
+            "schedule poll %s reached %s unique voters; announced %s",
             poll_message.id,
             AUTO_START_THRESHOLD,
             new_start_time,
@@ -1761,7 +1956,7 @@ class PollCog(commands.Cog):
         try:
             await channel.send(
                 content=(
-                    f"↩️ ~~{announcement.start_time}時開始 {role_mention}~~\n"
+                    f"↩️ ~~{format_start_label(announcement.start_time)} {role_mention}~~\n"
                     f"{reason}。以前の開始通知は無効です。"
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -1784,7 +1979,7 @@ class PollCog(commands.Cog):
             return
         try:
             await notification.edit(
-                content=f"{announcement.start_time}時開始 {role_mention}",
+                content=f"{format_start_label(announcement.start_time)} {role_mention}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
@@ -1833,15 +2028,18 @@ class PollCog(commands.Cog):
             discord.utils.escape_mentions(display_name)
         )
 
-    async def _collect_default_schedule_voters(
+    async def _collect_schedule_voters(
         self,
         poll_message: discord.Message,
+        options: list[str],
     ) -> dict[str, set[int]]:
         reactions_by_emoji = {
             str(reaction.emoji): reaction for reaction in poll_message.reactions
         }
         voters_by_option: dict[str, set[int]] = {}
-        for option, emoji in zip(DEFAULT_TIME_OPTIONS, DEFAULT_TIME_EMOJIS):
+        for option, emoji in zip(options, schedule_option_emojis(options)):
+            if normalize_schedule_time(option) is None:
+                continue
             reaction = reactions_by_emoji.get(emoji)
             voters: set[int] = set()
             if reaction is not None:
@@ -1852,13 +2050,14 @@ class PollCog(commands.Cog):
         return voters_by_option
 
     @staticmethod
-    async def _ensure_default_number_reactions(
+    async def _ensure_schedule_reactions(
         poll_message: discord.Message,
+        options: list[str],
     ) -> None:
         reactions_by_emoji = {
             str(reaction.emoji): reaction for reaction in poll_message.reactions
         }
-        for emoji in EMOJI_NUMBERS[:len(DEFAULT_SCHEDULE_OPTION_LIST)]:
+        for emoji in schedule_option_emojis(options):
             reaction = reactions_by_emoji.get(emoji)
             if reaction is None or not reaction.me:
                 await poll_message.add_reaction(emoji)
@@ -1894,7 +2093,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule update <投稿IDまたはリンク> 21 22 24 ng`",
+                "❌ 使い方: `/schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -1930,20 +2129,27 @@ class PollCog(commands.Cog):
         return True
 
     @staticmethod
-    async def _add_number_reactions(message: discord.Message, count: int):
-        for emoji in EMOJI_NUMBERS[:count]:
+    async def _add_schedule_reactions(
+        message: discord.Message,
+        options: list[str],
+    ):
+        for emoji in schedule_option_emojis(options):
             await message.add_reaction(emoji)
 
     @classmethod
-    async def _reset_number_reactions(cls, message: discord.Message, count: int):
-        number_emojis = [
+    async def _reset_schedule_reactions(
+        cls,
+        message: discord.Message,
+        options: list[str],
+    ):
+        schedule_emojis = [
             reaction.emoji
             for reaction in list(message.reactions)
-            if str(reaction.emoji) in EMOJI_NUMBERS
+            if str(reaction.emoji) in SCHEDULE_REACTION_EMOJIS
         ]
-        for emoji in number_emojis:
+        for emoji in schedule_emojis:
             await message.clear_reaction(emoji)
-        await cls._add_number_reactions(message, count)
+        await cls._add_schedule_reactions(message, options)
 
     @staticmethod
     async def _send_notice(ctx: commands.Context, content: str):

@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from kazekoshi.cogs.poll import (
     AUTO_START_GRACE_SECONDS,
+    DEFAULT_SCHEDULE_EMOJIS,
     DEFAULT_SCHEDULE_OPTIONS,
     DEFAULT_SCHEDULE_OPTION_LIST,
     EMOJI_NUMBERS,
@@ -22,9 +23,12 @@ from kazekoshi.cogs.poll import (
     format_schedule_options,
     is_auto_start_schedule,
     is_schedule_channel,
+    normalize_schedule_time,
     parse_message_id,
     parse_schedule_options,
     schedule_author_id,
+    schedule_option_emojis,
+    schedule_options_from_embed,
     start_announcement,
 )
 
@@ -196,10 +200,10 @@ class ScheduleHarness:
 
     def set_voters(self, voters_by_option):
         self.poll_message.reactions = []
-        for option, emoji in zip(
-            DEFAULT_SCHEDULE_OPTION_LIST,
-            EMOJI_NUMBERS,
-        ):
+        options = schedule_options_from_embed(self.poll_message.embeds[0])
+        if options is None:
+            raise AssertionError("schedule options could not be read from test embed")
+        for option, emoji in zip(options, schedule_option_emojis(options)):
             users = [self.bot_user]
             users.extend(
                 self.humans[user_id]
@@ -227,9 +231,30 @@ class ScheduleHarness:
 class ScheduleParsingTests(unittest.TestCase):
     def test_parse_space_separated_options(self):
         self.assertEqual(
-            parse_schedule_options("21 22 23 ng"),
-            ["21", "22", "23", "ng"],
+            parse_schedule_options("21:00 22:00 23:00 NG"),
+            ["21:00", "22:00", "23:00", "NG"],
         )
+
+    def test_supported_time_formats_are_normalized_for_display(self):
+        expected = ["15:00", "16:00", "17:00"]
+        for value in (
+            "15 16 17",
+            "15:00 16:00 17:00",
+            "1500 1600 1700",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(parse_schedule_options(value), expected)
+
+        self.assertEqual(
+            parse_schedule_options("1530 16:30 17 NG"),
+            ["15:30", "16:30", "17:00", "NG"],
+        )
+
+    def test_time_normalization_rejects_invalid_clock_values(self):
+        self.assertEqual(normalize_schedule_time("24"), "24:00")
+        self.assertEqual(normalize_schedule_time("0900"), "09:00")
+        self.assertIsNone(normalize_schedule_time("24:30"))
+        self.assertIsNone(normalize_schedule_time("2360"))
 
     def test_parse_quoted_option(self):
         self.assertEqual(
@@ -247,12 +272,12 @@ class ScheduleParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleInputError, "引用符"):
             parse_schedule_options('"21 22')
         with self.assertRaisesRegex(ScheduleInputError, "100文字以内"):
-            parse_schedule_options(f"{'x' * 101} ng")
+            parse_schedule_options(f"{'x' * 101} NG")
 
     def test_format_uses_number_reactions_in_order(self):
         self.assertEqual(
-            format_schedule_options(["21", "22", "ng"]),
-            "1️⃣：21\n2️⃣：22\n3️⃣：ng",
+            format_schedule_options(["21:00", "22:00", "NG"]),
+            "1️⃣21:00, 2️⃣22:00, 🆖NG",
         )
 
     def test_parse_message_id_or_link(self):
@@ -268,18 +293,30 @@ class ScheduleParsingTests(unittest.TestCase):
 
     def test_choose_start_time_counts_distinct_people_from_early_time(self):
         voters = {
-            "20": set(),
-            "21": {5},
-            "22": {4},
-            "23": {2, 3},
-            "24": {1, 2},
-            "ng": {6, 7, 8, 9, 10},
+            "20:00": set(),
+            "20:30": set(),
+            "21:00": {5},
+            "21:30": set(),
+            "22:00": {4},
+            "22:30": set(),
+            "23:00": {2, 3},
+            "24:00": {1, 2},
+            "NG": {6, 7, 8, 9, 10},
         }
 
-        self.assertEqual(choose_start_time(voters), "24")
+        self.assertEqual(choose_start_time(voters), "24:00")
         self.assertIsNone(
-            choose_start_time({"24": {1, 2}, "23": {1, 2}, "ng": {3, 4, 5}})
+            choose_start_time({"24:00": {1, 2}, "23:00": {1, 2}, "NG": {3, 4, 5}})
         )
+
+    def test_choose_start_time_supports_custom_formats_and_sorts_by_time(self):
+        voters = {
+            "1700": {4, 5},
+            "15": {1, 2},
+            "16:00": {3},
+        }
+
+        self.assertEqual(choose_start_time(voters), "17:00")
 
 
 class ScheduleDisplayTests(unittest.TestCase):
@@ -287,33 +324,61 @@ class ScheduleDisplayTests(unittest.TestCase):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
 
-        embed = build_schedule_embed(role, ["21", "22", "ng"], author)
+        embed = build_schedule_embed(role, ["21:00", "22:00", "NG"], author)
 
         self.assertEqual(embed.title, "📅 VALORANT 開始時間")
-        self.assertEqual(embed.description, "1️⃣：21\n2️⃣：22\n3️⃣：ng")
+        self.assertEqual(embed.description, "1️⃣21:00, 2️⃣22:00, 🆖NG")
         self.assertEqual(schedule_author_id(embed), 987)
 
     def test_non_schedule_embed_has_no_creator(self):
         self.assertIsNone(schedule_author_id(discord.Embed(title="other")))
 
-    def test_only_omitted_default_poll_has_auto_start_marker(self):
+    def test_supported_time_poll_has_auto_start_marker_when_enabled(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
-        default_embed = build_schedule_embed(
+        time_embed = build_schedule_embed(
             role,
-            list(DEFAULT_SCHEDULE_OPTION_LIST),
+            parse_schedule_options("1500 1600 1700 NG"),
             author,
             auto_start=True,
         )
-        custom_embed = build_schedule_embed(
+        markerless_embed = build_schedule_embed(
             role,
             list(DEFAULT_SCHEDULE_OPTION_LIST),
             author,
         )
+        non_time_embed = build_schedule_embed(
+            role,
+            ["平日", "休日", "NG"],
+            author,
+            auto_start=True,
+        )
 
-        self.assertTrue(is_auto_start_schedule(default_embed))
-        self.assertIsNone(announced_start_time(default_embed))
-        self.assertFalse(is_auto_start_schedule(custom_embed))
+        self.assertTrue(is_auto_start_schedule(time_embed))
+        self.assertEqual(
+            time_embed.description,
+            "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
+        )
+        self.assertIsNone(announced_start_time(time_embed))
+        self.assertFalse(is_auto_start_schedule(markerless_embed))
+        self.assertFalse(is_auto_start_schedule(non_time_embed))
+
+    def test_legacy_multiline_options_remain_readable(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(
+            role,
+            ["15:00", "16:00", "17:00", "NG"],
+            author,
+            auto_start=True,
+        )
+        embed.description = "1️⃣：15\n2️⃣：16\n3️⃣：17\n4️⃣：ng"
+
+        self.assertEqual(
+            schedule_options_from_embed(embed),
+            ["15", "16", "17", "ng"],
+        )
+        self.assertTrue(is_auto_start_schedule(embed))
 
     def test_creator_id_cannot_be_spoofed_by_display_name(self):
         role = SimpleNamespace(name="VALORANT")
@@ -321,7 +386,7 @@ class ScheduleDisplayTests(unittest.TestCase):
             display_name="fake | 作成者ID: 123 | name",
             id=987,
         )
-        embed = build_schedule_embed(role, ["21", "ng"], author)
+        embed = build_schedule_embed(role, ["21:00", "NG"], author)
 
         self.assertEqual(schedule_author_id(embed), 987)
 
@@ -480,13 +545,17 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_auto_start_schedule(sent["embed"]))
         self.assertEqual(
             sent["embed"].description,
-            "1️⃣：20\n2️⃣：21\n3️⃣：22\n4️⃣：23\n5️⃣：24\n6️⃣：ng",
+            "1️⃣20:00, 2️⃣20:30, 3️⃣21:00, 4️⃣21:30, 5️⃣22:00, "
+            "6️⃣22:30, 7️⃣23:00, 8️⃣24:00, 🆖NG",
         )
         self.assertEqual(
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
-            EMOJI_NUMBERS[:6],
+            list(DEFAULT_SCHEDULE_EMOJIS),
         )
-        self.assertEqual(DEFAULT_SCHEDULE_OPTIONS, "20 21 22 23 24 ng")
+        self.assertEqual(
+            DEFAULT_SCHEDULE_OPTIONS,
+            "20:00 20:30 21:00 21:30 22:00 22:30 23:00 24:00 NG",
+        )
         registered = self.registry.all()
         self.assertEqual(len(registered), 1)
         self.assertEqual(
@@ -499,13 +568,23 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         ctx.send.reset_mock()
+        poll_message.add_reaction.reset_mock()
         await PollCog.schedule_add.callback(
             cog,
             ctx,
             role,
-            options=DEFAULT_SCHEDULE_OPTIONS,
+            options="1500 1600 1700 NG",
         )
-        self.assertFalse(is_auto_start_schedule(ctx.send.await_args.kwargs["embed"]))
+        custom_embed = ctx.send.await_args.kwargs["embed"]
+        self.assertTrue(is_auto_start_schedule(custom_embed))
+        self.assertEqual(
+            custom_embed.description,
+            "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
+        )
+        self.assertEqual(
+            [call.args[0] for call in poll_message.add_reaction.await_args_list],
+            ["1️⃣", "2️⃣", "3️⃣", "🆖"],
+        )
 
     async def test_add_prunes_expired_registry_rows_before_registering_new_poll(self):
         expired_id = schedule_snowflake(
@@ -608,6 +687,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         bot_user = SimpleNamespace(id=1)
         bot = SimpleNamespace(valorant_channel_id=0, user=bot_user)
         cog = PollCog(bot, registry=self.registry)
+        cog._queue_auto_start_check_by_id = Mock()
         permissions = SimpleNamespace(
             mention_everyone=True,
             manage_messages=True,
@@ -655,7 +735,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         ctx = SimpleNamespace(
             bot=bot,
-            guild=SimpleNamespace(me=SimpleNamespace(id=1)),
+            guild=SimpleNamespace(id=1, me=SimpleNamespace(id=1)),
             channel=channel,
             author=author,
             interaction=object(),
@@ -667,7 +747,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             cog,
             ctx,
             "99",
-            options="22 23 ng",
+            options="1500 1600 1700 NG",
         )
 
         self.assertEqual(
@@ -675,13 +755,22 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             EMOJI_NUMBERS[:2],
         )
         edited_embed = poll_message.edit.await_args.kwargs["embed"]
-        self.assertEqual(edited_embed.description, "1️⃣：22\n2️⃣：23\n3️⃣：ng")
-        self.assertFalse(is_auto_start_schedule(edited_embed))
+        self.assertEqual(
+            edited_embed.description,
+            "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
+        )
+        self.assertTrue(is_auto_start_schedule(edited_embed))
         self.assertIsNone(announced_start_time(edited_embed))
         self.assertEqual(
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
-            EMOJI_NUMBERS[:3],
+            ["1️⃣", "2️⃣", "3️⃣", "🆖"],
         )
+        cog._queue_auto_start_check_by_id.assert_called_once_with(
+            guild_id=1,
+            channel_id=10,
+            message_id=99,
+        )
+        self.assertEqual([poll.message_id for poll in self.registry.all()], [99])
         self.assertIn("投票をリセット", ctx.send.await_args.args[0])
 
     async def test_prefix_add_requires_an_actual_role_mention(self):
@@ -718,7 +807,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         poll_message = SimpleNamespace(
             id=99,
             author=bot_user,
-            embeds=[build_schedule_embed(role, ["21", "22"], creator)],
+            embeds=[build_schedule_embed(role, ["21:00", "22:00"], creator)],
             reactions=[],
             clear_reaction=AsyncMock(),
         )
@@ -754,7 +843,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             cog,
             ctx,
             "99",
-            options="22 23 ng",
+            options="22:00 23:00 NG",
         )
 
         poll_message.clear_reaction.assert_not_awaited()
@@ -817,9 +906,9 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def assert_remove_then_clear_uses_generic_reason(self, clear_event):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.channel.send.reset_mock()
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         first_sleep, first_task = await self.queue_check(
             "remove",
             emoji="1️⃣",
@@ -849,7 +938,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_waits_ten_seconds_and_persists_first_notification_id(self):
         self.assertEqual(AUTO_START_GRACE_SECONDS, 10)
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
 
         sleep_call, task = await self.queue_check()
 
@@ -862,11 +951,45 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.harness.channel.send.assert_awaited_once()
         notification = self.harness.channel.send.await_args
-        self.assertEqual(notification.kwargs["content"], "20時開始 <@&88>")
+        self.assertEqual(notification.kwargs["content"], "20:00 開始 <@&88>")
         self.assertEqual(notification.kwargs["allowed_mentions"].roles, [self.harness.role])
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "20")
+        self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, 1000)
+
+    async def test_custom_compact_times_are_normalized_and_auto_evaluated(self):
+        options = parse_schedule_options("1500 1600 1700")
+        self.harness.poll_message.embeds = [
+            build_schedule_embed(
+                self.harness.role,
+                options,
+                self.harness.creator,
+                auto_start=True,
+            )
+        ]
+        self.harness.set_voters(
+            {
+                "15:00": {2, 3},
+                "16:00": {4},
+                "17:00": {5, 6},
+            }
+        )
+
+        sleep_call, task = await self.queue_check(emoji="3️⃣", user_id=6)
+        await self.finish_check(sleep_call, task)
+
+        self.assertEqual(
+            self.harness.poll_message.embeds[0].description,
+            "1️⃣15:00, 2️⃣16:00, 3️⃣17:00",
+        )
+        self.assertEqual(
+            self.harness.channel.send.await_args.kwargs["content"],
+            "17:00 開始 <@&88>",
+        )
+        self.assertEqual(
+            start_announcement(self.harness.poll_message.embeds[0]).start_time,
+            "17:00",
+        )
 
     async def test_cog_load_prunes_expired_rows_before_recovery(self):
         expired_id = schedule_snowflake(
@@ -931,7 +1054,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_prune_during_notification_send_deletes_transition_output(self):
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         send_started = asyncio.Event()
         release_send = asyncio.Event()
         original_send = self.harness._send_message
@@ -979,11 +1102,11 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prune_during_cancellation_send_restores_discord_state(self):
         old_notification = await self.announce(
-            {"20": {2, 3, 4, 5, 6}},
-            "20",
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
         )
         self.harness.channel.send.reset_mock()
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         send_started = asyncio.Event()
         release_send = asyncio.Event()
         original_send = self.harness._send_message
@@ -1019,10 +1142,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         cancellation_notice = self.harness.notifications[1001]
         cancellation_notice.delete.assert_awaited_once()
         self.assert_allowed_mentions_none(cancellation_notice.allowed_mentions)
-        self.assertEqual(old_notification.content, "20時開始 <@&88>")
+        self.assertEqual(old_notification.content, "20:00 開始 <@&88>")
         self.assert_allowed_mentions_none(old_notification.allowed_mentions)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "20")
+        self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, old_notification.id)
         self.assertEqual(self.registry.all(), [])
         self.assertNotIn(
@@ -1040,7 +1163,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             channel_id=self.harness.CHANNEL_ID,
             message_id=self.harness.POLL_MESSAGE_ID,
         )
-        self.harness.set_voters({"21": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"21:00": {2, 3, 4, 5, 6}})
         prune_expired = self.harness.cog._prune_expired_schedule_polls
         self.harness.cog._prune_expired_schedule_polls = Mock(
             side_effect=lambda *, now=None: prune_expired(now=FIXED_NOW)
@@ -1062,14 +1185,14 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.harness.channel.send.assert_awaited_once()
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "21")
+        self.assertEqual(announcement.start_time, "21:00")
         self.assertEqual(announcement.message_id, 1000)
 
     async def test_reaction_removed_within_ten_seconds_prevents_notification(self):
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check()
 
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         second_sleep, second_task = await self.queue_check(
             "remove",
             emoji="1️⃣",
@@ -1086,13 +1209,13 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(start_announcement(self.harness.poll_message.embeds[0]))
 
     async def test_continuous_events_restart_debounce_and_use_only_latest_state(self):
-        self.harness.set_voters({"24": {2, 3, 4}})
+        self.harness.set_voters({"24:00": {2, 3, 4}})
         first_sleep, first_task = await self.queue_check()
 
-        self.harness.set_voters({"24": {2, 3, 4, 5}})
+        self.harness.set_voters({"24:00": {2, 3, 4, 5}})
         second_sleep, second_task = await self.queue_check()
 
-        self.harness.set_voters({"24": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"24:00": {2, 3, 4, 5, 6}})
         third_sleep, third_task = await self.queue_check()
 
         self.assertTrue(first_sleep.future.cancelled())
@@ -1110,34 +1233,34 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.harness.channel.send.assert_awaited_once()
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
-            "24",
+            "24:00",
         )
 
     async def test_remove_below_five_strikes_old_notification_and_posts_cancellation(self):
         old_notification = await self.announce(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5},
-                "24": {6},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5},
+                "24:00": {6},
             },
-            "24",
+            "24:00",
         )
         self.harness.channel.send.reset_mock()
         self.harness.poll_message.edit.reset_mock()
         self.harness.set_voters(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5},
             }
         )
 
         sleep_call, task = await self.queue_check(
             "remove",
-            emoji="5️⃣",
+            emoji="8️⃣",
             user_id=999,
         )
 
@@ -1146,7 +1269,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         old_notification.edit.assert_awaited_once()
         cancelled_content = old_notification.edit.await_args.kwargs["content"]
-        self.assertIn("~~24時開始 <@&88>~~", cancelled_content)
+        self.assertIn("~~24:00 開始 <@&88>~~", cancelled_content)
         self.assertIn("取り消されました", cancelled_content)
         self.assertFalse(
             old_notification.edit.await_args.kwargs["allowed_mentions"].roles
@@ -1155,15 +1278,15 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_auto_start_schedule(self.harness.poll_message.embeds[0]))
         self.harness.channel.send.assert_awaited_once()
         cancellation = self.harness.channel.send.await_args.kwargs
-        self.assertIn("24時開始の通知を取り消しました", cancellation["content"])
+        self.assertIn("24:00 開始の通知を取り消しました", cancellation["content"])
         self.assertIn("5人未満", cancellation["content"])
         self.assertFalse(cancellation["allowed_mentions"].roles)
 
     async def test_remove_below_five_names_cancelled_participant_without_mentions(self):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.channel.send.reset_mock()
         self.harness.humans[6].display_name = "Alice"
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
 
         sleep_call, task = await self.queue_check(
             "remove",
@@ -1175,24 +1298,24 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         cancellation = self.harness.channel.send.await_args.kwargs
         self.assertEqual(
             cancellation["content"],
-            "↩️ 20時開始の通知を取り消しました <@&88>\n"
+            "↩️ 20:00 開始の通知を取り消しました <@&88>\n"
             "Aliceの参加がキャンセルされました。",
         )
         self.assert_allowed_mentions_none(cancellation["allowed_mentions"])
 
     async def test_second_remove_replaces_first_cancelled_participant(self):
-        await self.announce({"20": {2, 3, 4, 5, 6, 7}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6, 7}}, "20:00")
         self.harness.channel.send.reset_mock()
         self.harness.humans[7].display_name = "Alice"
         self.harness.humans[6].display_name = "Bob"
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check(
             "remove",
             emoji="1️⃣",
             user_id=7,
         )
 
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         second_sleep, second_task = await self.queue_check(
             "remove",
             emoji="1️⃣",
@@ -1212,26 +1335,26 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_allowed_mentions_none(cancellation["allowed_mentions"])
 
     async def test_add_after_remove_keeps_cancelled_participant(self):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.channel.send.reset_mock()
         self.harness.humans[6].display_name = "Alice"
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         remove_sleep, remove_task = await self.queue_check(
             "remove",
             emoji="1️⃣",
             user_id=6,
         )
 
-        # 既に20時へ投票中の人が21時にも投票しても、distinct人数は4人のまま。
+        # 既に20:00へ投票中の人が21:00にも投票しても、distinct人数は4人のまま。
         self.harness.set_voters(
             {
-                "20": {2, 3, 4, 5},
-                "21": {2},
+                "20:00": {2, 3, 4, 5},
+                "21:00": {2},
             }
         )
         add_sleep, add_task = await self.queue_check(
             "add",
-            emoji="2️⃣",
+            emoji="3️⃣",
             user_id=2,
         )
 
@@ -1253,10 +1376,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_remove_then_clear_uses_generic_reason("clear")
 
     async def test_cancelled_participant_name_is_sanitized(self):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.channel.send.reset_mock()
         self.harness.humans[6].display_name = "@everyone\n**danger** _x_"
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
 
         sleep_call, task = await self.queue_check(
             "remove",
@@ -1276,10 +1399,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_allowed_mentions_none(cancellation["allowed_mentions"])
 
     async def test_cancellation_notice_retries_once_with_same_participant(self):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.channel.send.reset_mock()
         self.harness.humans[6].display_name = "Alice"
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         retry_sleeper = ControlledSleeper()
         self.harness.cog._retry_sleep = retry_sleeper
         response = Mock(status=500, reason="Server Error")
@@ -1328,46 +1451,46 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_remove_changes_start_time_and_replaces_notification(self):
         old_notification = await self.announce(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5, 6},
-                "24": {7},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5, 6},
+                "24:00": {7},
             },
-            "23",
+            "23:00",
         )
         self.harness.channel.send.reset_mock()
         self.harness.poll_message.edit.reset_mock()
         self.harness.set_voters(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5},
-                "24": {7},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5},
+                "24:00": {7},
             }
         )
 
-        sleep_call, task = await self.queue_check("remove", emoji="4️⃣")
+        sleep_call, task = await self.queue_check("remove", emoji="7️⃣")
         await self.finish_check(sleep_call, task)
 
         old_notification.edit.assert_awaited_once()
         old_content = old_notification.edit.await_args.kwargs["content"]
-        self.assertIn("~~23時開始 <@&88>~~", old_content)
-        self.assertIn("24時開始へ変更", old_content)
+        self.assertIn("~~23:00 開始 <@&88>~~", old_content)
+        self.assertIn("24:00 開始へ変更", old_content)
         self.harness.channel.send.assert_awaited_once()
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertIn("24時開始 <@&88>", replacement["content"])
-        self.assertIn("23時開始から変更", replacement["content"])
+        self.assertIn("24:00 開始 <@&88>", replacement["content"])
+        self.assertIn("23:00 開始から変更", replacement["content"])
         self.assertFalse(replacement["allowed_mentions"].roles)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "24")
+        self.assertEqual(announcement.start_time, "24:00")
         self.assertEqual(announcement.message_id, 1001)
 
     async def test_deleted_target_role_does_not_leave_old_start_time_active(self):
         old_notification = await self.announce(
-            {"20": {2, 3, 4, 5, 6}},
-            "20",
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
         )
         self.harness.channel.send.reset_mock()
         self.harness.poll_message.edit.reset_mock()
@@ -1377,58 +1500,58 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.harness.set_voters(
             {
-                "20": {2, 3, 4, 5},
-                "21": {6},
+                "20:00": {2, 3, 4, 5},
+                "21:00": {6},
             }
         )
 
         sleep_call, task = await self.queue_check("remove", emoji="1️⃣")
         await self.finish_check(sleep_call, task)
 
-        self.assertIn("~~20時開始 <@&88>~~", old_notification.content)
-        self.assertIn("21時開始へ変更", old_notification.content)
+        self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
+        self.assertIn("21:00 開始へ変更", old_notification.content)
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertIn("21時開始 <@&88>", replacement["content"])
+        self.assertIn("21:00 開始 <@&88>", replacement["content"])
         self.assertFalse(replacement["allowed_mentions"].roles)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "21")
+        self.assertEqual(announcement.start_time, "21:00")
         self.assertEqual(announcement.message_id, 1001)
 
     async def test_vote_change_with_same_start_time_is_noop(self):
         old_notification = await self.announce(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5, 6},
-                "24": {6, 7},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5, 6},
+                "24:00": {6, 7},
             },
-            "23",
+            "23:00",
         )
         self.harness.channel.send.reset_mock()
         self.harness.poll_message.edit.reset_mock()
         self.harness.set_voters(
             {
-                "20": {2},
-                "21": {3},
-                "22": {4},
-                "23": {5, 6},
-                "24": {6},
+                "20:00": {2},
+                "21:00": {3},
+                "22:00": {4},
+                "23:00": {5, 6},
+                "24:00": {6},
             }
         )
 
-        sleep_call, task = await self.queue_check("remove", emoji="5️⃣")
+        sleep_call, task = await self.queue_check("remove", emoji="8️⃣")
         await self.finish_check(sleep_call, task)
 
         old_notification.edit.assert_not_awaited()
         self.harness.channel.send.assert_not_awaited()
         self.harness.poll_message.edit.assert_not_awaited()
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "23")
+        self.assertEqual(announcement.start_time, "23:00")
         self.assertEqual(announcement.message_id, old_notification.id)
 
     async def test_clear_emoji_and_clear_all_events_are_debounced(self):
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check(
             "clear_emoji",
             emoji="5️⃣",
@@ -1439,7 +1562,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         old_notification = self.harness.notifications[1000]
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
-            "20",
+            "20:00",
         )
 
         self.harness.channel.send.reset_mock()
@@ -1451,14 +1574,14 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         old_notification.edit.assert_awaited_once()
         self.assertIn(
-            "~~20時開始 <@&88>~~",
+            "~~20:00 開始 <@&88>~~",
             old_notification.edit.await_args.kwargs["content"],
         )
         self.assertIsNone(start_announcement(self.harness.poll_message.embeds[0]))
         self.harness.channel.send.assert_awaited_once()
         self.assertEqual(
             [call.args[0] for call in self.harness.poll_message.add_reaction.await_args_list],
-            EMOJI_NUMBERS[:6],
+            list(DEFAULT_SCHEDULE_EMOJIS),
         )
 
     async def test_clear_ng_reseeds_all_options_without_start_notification(self):
@@ -1466,13 +1589,13 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.harness.poll_message.reactions = [
             reaction
             for reaction in self.harness.poll_message.reactions
-            if str(reaction.emoji) != "6️⃣"
+            if str(reaction.emoji) != "🆖"
         ]
         self.harness.poll_message.add_reaction.reset_mock()
 
         sleep_call, task = await self.queue_check(
             "clear_emoji",
-            emoji="6️⃣",
+            emoji="🆖",
         )
 
         self.assertEqual(sleep_call.delay, 10)
@@ -1481,7 +1604,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         await self.finish_check(sleep_call, task)
 
-        self.harness.poll_message.add_reaction.assert_awaited_once_with("6️⃣")
+        self.harness.poll_message.add_reaction.assert_awaited_once_with("🆖")
         seeded_emojis = {
             str(reaction.emoji)
             for reaction in self.harness.poll_message.reactions
@@ -1491,32 +1614,32 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             call.args[0]
             for call in self.harness.poll_message.add_reaction.await_args_list
         )
-        self.assertEqual(seeded_emojis, set(EMOJI_NUMBERS[:6]))
+        self.assertEqual(seeded_emojis, set(DEFAULT_SCHEDULE_EMOJIS))
         self.harness.channel.send.assert_not_awaited()
         self.assertIsNone(start_announcement(self.harness.poll_message.embeds[0]))
 
     async def test_cancelled_poll_can_recover_without_reping_role(self):
-        await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
-        self.harness.set_voters({"20": {2, 3, 4, 5}})
+        await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
+        self.harness.set_voters({"20:00": {2, 3, 4, 5}})
         cancel_sleep, cancel_task = await self.queue_check("remove", emoji="1️⃣")
         await self.finish_check(cancel_sleep, cancel_task)
         self.assertIsNone(start_announcement(self.harness.poll_message.embeds[0]))
 
         self.harness.channel.send.reset_mock()
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         restore_sleep, restore_task = await self.queue_check("add", emoji="1️⃣")
         await self.finish_check(restore_sleep, restore_task)
 
         restored = self.harness.channel.send.await_args.kwargs
-        self.assertEqual(restored["content"], "20時開始 <@&88>")
+        self.assertEqual(restored["content"], "20:00 開始 <@&88>")
         self.assertFalse(restored["allowed_mentions"].roles)
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
-            "20",
+            "20:00",
         )
 
     async def test_deleted_start_notification_is_recreated_without_reping(self):
-        notification = await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        notification = await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
         self.harness.notifications.pop(notification.id)
         self.harness.channel.send.reset_mock()
         call_index = len(self.sleeper.calls)
@@ -1532,7 +1655,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_check(self.sleeper.calls[call_index], task)
 
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertEqual(replacement["content"], "20時開始 <@&88>")
+        self.assertEqual(replacement["content"], "20:00 開始 <@&88>")
         self.assertFalse(replacement["allowed_mentions"].roles)
         self.assertNotEqual(
             start_announcement(self.harness.poll_message.embeds[0]).message_id,
@@ -1540,7 +1663,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_deleted_new_notification_during_poll_edit_requeues_check(self):
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         edit_started = asyncio.Event()
         release_edit = asyncio.Event()
         original_edit = self.harness._edit_poll
@@ -1590,14 +1713,14 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_check(self.sleeper.calls[1], pending_check)
 
         replacement = self.harness.notifications[1001]
-        self.assertEqual(replacement.content, "20時開始 <@&88>")
+        self.assertEqual(replacement.content, "20:00 開始 <@&88>")
         self.assert_allowed_mentions_none(replacement.allowed_mentions)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "20")
+        self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, replacement.id)
 
     async def test_deleted_poll_cancels_active_notification(self):
-        notification = await self.announce({"20": {2, 3, 4, 5, 6}}, "20")
+        notification = await self.announce({"20:00": {2, 3, 4, 5, 6}}, "20:00")
 
         await self.harness.cog.on_raw_message_delete(
             SimpleNamespace(
@@ -1606,20 +1729,20 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertIn("~~20時開始 <@&88>~~", notification.content)
+        self.assertIn("~~20:00 開始 <@&88>~~", notification.content)
         self.assertIn("投票が削除", notification.content)
         self.assertEqual(self.registry.all(), [])
 
     async def test_deleted_poll_wins_against_in_progress_transition(self):
         old_notification = await self.announce(
-            {"20": {2, 3, 4, 5, 6}},
-            "20",
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
         )
         self.harness.channel.send.reset_mock()
         self.harness.set_voters(
             {
-                "20": {2, 3, 4, 5},
-                "21": {6},
+                "20:00": {2, 3, 4, 5},
+                "21:00": {6},
             }
         )
         transition_edit_started = asyncio.Event()
@@ -1665,7 +1788,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             await transition_task
         await deletion_task
 
-        self.assertIn("~~20時開始 <@&88>~~", old_notification.content)
+        self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("投票が削除", old_notification.content)
         replacement = self.harness.notifications[1001]
         replacement.delete.assert_awaited_once()
@@ -1708,7 +1831,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.harness.channel.send.side_effect = flaky_send
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check()
         await self.finish_check(first_sleep, first_task)
         await self.sleeper.wait_for_calls(2)
@@ -1722,7 +1845,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
-            "20",
+            "20:00",
         )
 
     async def test_poll_edit_failure_retries_without_reping_role(self):
@@ -1741,7 +1864,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             return await self.harness._edit_poll(embed=embed)
 
         self.harness.poll_message.edit.side_effect = fail_first_edit
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         first_sleep, first_task = await self.queue_check()
         await self.finish_check(first_sleep, first_task)
         await self.sleeper.wait_for_calls(2)
@@ -1762,7 +1885,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_allowed_mentions_none(retry_send["allowed_mentions"])
         replacement = self.harness.notifications[1001]
         announcement = start_announcement(self.harness.poll_message.embeds[0])
-        self.assertEqual(announcement.start_time, "20")
+        self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, replacement.id)
         self.assertEqual(edit_attempts, 3)
 
@@ -1775,7 +1898,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             embed_links=True,
         )
         self.harness.channel.permissions_for = lambda _: permissions
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         sleep_call, pending_task = await self.queue_check()
         ctx = SimpleNamespace(
             bot=self.harness.bot,
@@ -1791,7 +1914,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             self.harness.cog,
             ctx,
             str(self.harness.POLL_MESSAGE_ID),
-            options="22 23 ng",
+            options="平日 休日 NG",
         )
 
         with self.assertRaises(asyncio.CancelledError):
@@ -1822,7 +1945,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.harness.channel.permissions_for = permissions_for
-        self.harness.set_voters({"20": {2, 3, 4, 5, 6}})
+        self.harness.set_voters({"20:00": {2, 3, 4, 5, 6}})
         sleep_call, pending_task = await self.queue_check()
         ctx = SimpleNamespace(
             bot=self.harness.bot,
@@ -1838,7 +1961,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             self.harness.cog,
             ctx,
             str(self.harness.POLL_MESSAGE_ID),
-            options="22 23 ng",
+            options="22:00 23:00 NG",
         )
 
         self.assertFalse(pending_task.cancelled())
@@ -1848,8 +1971,8 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schedule_close_disables_poll_and_cancels_active_notification(self):
         old_notification = await self.announce(
-            {"20": {2, 3, 4, 5, 6}},
-            "20",
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
         )
         permissions = SimpleNamespace(
             manage_messages=True,
@@ -1877,7 +2000,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_auto_start_schedule(embed))
         self.assertTrue(embed.title.endswith("（終了）"))
         self.assertIn("投票終了", embed.footer.text)
-        self.assertIn("~~20時開始 <@&88>~~", old_notification.content)
+        self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("投票が終了", old_notification.content)
         self.assertEqual(self.registry.all(), [])
         self.assertIn("投票を終了", ctx.send.await_args.args[0])
