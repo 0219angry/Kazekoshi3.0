@@ -10,6 +10,7 @@ from logging import getLogger
 from pathlib import Path
 from typing import Optional
 from weakref import WeakValueDictionary
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -63,6 +64,10 @@ AUTO_START_MAX_RETRIES = 2
 AUTO_START_NOTICE_RETRY_DELAY_SECONDS = 2
 SCHEDULE_RETENTION_DAYS = 90
 SCHEDULE_REGISTRY_PATH = Path("json/schedule_polls.sqlite3")
+SCHEDULE_TIMEZONE = ZoneInfo("Asia/Tokyo")
+SCHEDULE_DEADLINE_MAX_DAYS = 90
+SCHEDULE_DEADLINE_FIELD_NAME = "締切"
+SCHEDULE_DEADLINE_VALUE_PATTERN = re.compile(r"<t:(?P<timestamp>\d+):F>")
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -119,6 +124,7 @@ class RegisteredSchedulePoll:
     guild_id: int
     channel_id: int
     message_id: int
+    deadline_at: datetime | None = None
 
 
 class SchedulePollRegistry:
@@ -135,10 +141,19 @@ class SchedulePollRegistry:
             CREATE TABLE IF NOT EXISTS schedule_polls (
                 message_id INTEGER PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL
+                channel_id INTEGER NOT NULL,
+                deadline_at REAL
             )
             """
         )
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(schedule_polls)")
+        }
+        if "deadline_at" not in columns:
+            connection.execute(
+                "ALTER TABLE schedule_polls ADD COLUMN deadline_at REAL"
+            )
         return connection
 
     def register(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
@@ -146,11 +161,50 @@ class SchedulePollRegistry:
             with connection:
                 connection.execute(
                     """
-                    INSERT OR REPLACE INTO schedule_polls
-                        (message_id, guild_id, channel_id)
-                    VALUES (?, ?, ?)
+                    INSERT INTO schedule_polls
+                        (message_id, guild_id, channel_id, deadline_at)
+                    VALUES (?, ?, ?, NULL)
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        guild_id = excluded.guild_id,
+                        channel_id = excluded.channel_id
                     """,
                     (message_id, guild_id, channel_id),
+                )
+
+    def set_deadline(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        deadline_at: datetime,
+    ) -> None:
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO schedule_polls
+                        (message_id, guild_id, channel_id, deadline_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        guild_id = excluded.guild_id,
+                        channel_id = excluded.channel_id,
+                        deadline_at = excluded.deadline_at
+                    """,
+                    (
+                        message_id,
+                        guild_id,
+                        channel_id,
+                        deadline_at.timestamp(),
+                    ),
+                )
+
+    def clear_deadline(self, message_id: int) -> None:
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE schedule_polls SET deadline_at = NULL WHERE message_id = ?",
+                    (message_id,),
                 )
 
     def unregister(self, message_id: int) -> None:
@@ -164,9 +218,12 @@ class SchedulePollRegistry:
     def all(self) -> list[RegisteredSchedulePoll]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT guild_id, channel_id, message_id FROM schedule_polls"
+                """
+                SELECT guild_id, channel_id, message_id, deadline_at
+                FROM schedule_polls
+                """
             ).fetchall()
-        return [RegisteredSchedulePoll(*row) for row in rows]
+        return [self._registered_poll_from_row(row) for row in rows]
 
     def prune_before(self, cutoff_message_id: int) -> list[RegisteredSchedulePoll]:
         """指定したDiscord Snowflakeより古い登録を削除して返す。"""
@@ -174,17 +231,35 @@ class SchedulePollRegistry:
             with connection:
                 rows = connection.execute(
                     """
-                    SELECT guild_id, channel_id, message_id
+                    SELECT guild_id, channel_id, message_id, deadline_at
                     FROM schedule_polls
-                    WHERE message_id < ?
+                    WHERE message_id < ? AND deadline_at IS NULL
                     """,
                     (cutoff_message_id,),
                 ).fetchall()
                 connection.execute(
-                    "DELETE FROM schedule_polls WHERE message_id < ?",
+                    """
+                    DELETE FROM schedule_polls
+                    WHERE message_id < ? AND deadline_at IS NULL
+                    """,
                     (cutoff_message_id,),
                 )
-        return [RegisteredSchedulePoll(*row) for row in rows]
+        return [self._registered_poll_from_row(row) for row in rows]
+
+    @staticmethod
+    def _registered_poll_from_row(row) -> RegisteredSchedulePoll:
+        guild_id, channel_id, message_id, deadline_timestamp = row
+        deadline_at = (
+            datetime.fromtimestamp(deadline_timestamp, timezone.utc)
+            if deadline_timestamp is not None
+            else None
+        )
+        return RegisteredSchedulePoll(
+            guild_id,
+            channel_id,
+            message_id,
+            deadline_at,
+        )
 
 
 def parse_schedule_options(value: str) -> list[str]:
@@ -375,6 +450,50 @@ def parse_message_id(value: str) -> tuple[int, int | None]:
     return int(match.group("message_id")), int(match.group("channel_id"))
 
 
+def parse_schedule_deadline(
+    value: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """日本時間の締切入力をUTCへ変換する。解除指定ではNoneを返す。"""
+    raw_value = value.strip()
+    if raw_value.casefold() in {"clear", "none", "off", "解除", "なし"}:
+        return None
+
+    normalized_value = raw_value.replace("T", " ")
+    deadline_local = None
+    for date_format in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            deadline_local = datetime.strptime(normalized_value, date_format)
+            break
+        except ValueError:
+            continue
+    if deadline_local is None:
+        raise ScheduleInputError(
+            "締切は `YYYY-MM-DD HH:MM` 形式の日本時間、または `clear` で指定してください"
+        )
+
+    deadline_at = deadline_local.replace(tzinfo=SCHEDULE_TIMEZONE).astimezone(
+        timezone.utc
+    )
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_time = current_time.astimezone(timezone.utc)
+    if deadline_at <= current_time:
+        raise ScheduleInputError("締切は現在より後の日時を指定してください")
+    if deadline_at > current_time + timedelta(days=SCHEDULE_DEADLINE_MAX_DAYS):
+        raise ScheduleInputError(
+            f"締切は{SCHEDULE_DEADLINE_MAX_DAYS}日以内で指定してください"
+        )
+    return deadline_at
+
+
+def format_schedule_deadline(deadline_at: datetime) -> str:
+    timestamp = int(deadline_at.timestamp())
+    return f"<t:{timestamp}:F>（<t:{timestamp}:R>）"
+
+
 def schedule_author_id(embed: discord.Embed) -> int | None:
     if not embed.title or not embed.title.startswith(SCHEDULE_TITLE_PREFIX):
         return None
@@ -403,6 +522,51 @@ def schedule_minimum(embed: discord.Embed) -> int | None:
 
 def is_schedule_closed(embed: discord.Embed) -> bool:
     return SCHEDULE_CLOSED_MARKER in (embed.footer.text or "")
+
+
+def schedule_deadline_at(embed: discord.Embed) -> datetime | None:
+    for field in embed.fields:
+        if field.name != SCHEDULE_DEADLINE_FIELD_NAME:
+            continue
+        match = SCHEDULE_DEADLINE_VALUE_PATTERN.search(field.value)
+        if match is not None:
+            return datetime.fromtimestamp(
+                int(match.group("timestamp")),
+                timezone.utc,
+            )
+    return None
+
+
+def set_schedule_deadline(
+    embed: discord.Embed,
+    deadline_at: datetime | None,
+) -> None:
+    field_index = next(
+        (
+            index
+            for index, field in enumerate(embed.fields)
+            if field.name == SCHEDULE_DEADLINE_FIELD_NAME
+        ),
+        None,
+    )
+    if deadline_at is None:
+        if field_index is not None:
+            embed.remove_field(field_index)
+        return
+    value = format_schedule_deadline(deadline_at)
+    if field_index is None:
+        embed.add_field(
+            name=SCHEDULE_DEADLINE_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
+    else:
+        embed.set_field_at(
+            field_index,
+            name=SCHEDULE_DEADLINE_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
 
 
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
@@ -680,6 +844,9 @@ def build_schedule_status_embed(
     summary = [f"状態: {state}"]
     if minimum is not None:
         summary.append(f"最低人数: {minimum}人")
+    deadline_at = schedule_deadline_at(source_embed)
+    if deadline_at is not None:
+        summary.append(f"締切: {format_schedule_deadline(deadline_at)}")
     if auto_start_enabled and minimum is not None:
         start_time = choose_start_time(voters_by_option, minimum)
         summary.append(
@@ -719,12 +886,16 @@ class PollCog(commands.Cog):
         auto_start_grace_seconds: float = AUTO_START_GRACE_SECONDS,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         retry_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        deadline_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         registry: SchedulePollRegistry | None = None,
     ):
         self.bot = bot
         self._auto_start_grace_seconds = auto_start_grace_seconds
         self._sleep = sleeper
         self._retry_sleep = retry_sleeper
+        self._deadline_sleep = deadline_sleeper
+        self._now = now_provider
         self._schedule_registry = registry or SchedulePollRegistry()
         self._auto_start_locks: WeakValueDictionary[int, asyncio.Lock] = (
             WeakValueDictionary()
@@ -738,7 +909,14 @@ class PollCog(commands.Cog):
         self._registered_schedule_polls: dict[int, RegisteredSchedulePoll] = {}
         self._poll_notification_ids: dict[int, int] = {}
         self._notification_poll_refs: dict[int, RegisteredSchedulePoll] = {}
+        self._deadline_tasks: dict[int, asyncio.Task] = {}
         self._registry_recovery_task: asyncio.Task | None = None
+
+    def _utc_now(self) -> datetime:
+        now = self._now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc)
 
     async def cog_load(self) -> None:
         self._prune_expired_schedule_polls()
@@ -764,14 +942,19 @@ class PollCog(commands.Cog):
         if self._registry_recovery_task is not None:
             self._registry_recovery_task.cancel()
         tasks = list(self._auto_start_tasks.values())
+        deadline_tasks = list(self._deadline_tasks.values())
         self._auto_start_tasks.clear()
+        self._deadline_tasks.clear()
         self._auto_start_revisions.clear()
         self._last_cancelled_user_ids.clear()
         self._start_notified_poll_ids.clear()
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in deadline_tasks:
+            task.cancel()
+        pending_tasks = [*tasks, *deadline_tasks]
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         if self._registry_recovery_task is not None:
             await asyncio.gather(
                 self._registry_recovery_task,
@@ -785,6 +968,10 @@ class PollCog(commands.Cog):
     ) -> None:
         await self.bot.wait_until_ready()
         for poll in polls:
+            if poll.deadline_at is not None:
+                self._queue_schedule_deadline(poll)
+                if poll.deadline_at <= self._utc_now():
+                    continue
             self._queue_auto_start_check_by_id(
                 guild_id=poll.guild_id,
                 channel_id=poll.channel_id,
@@ -831,6 +1018,7 @@ class PollCog(commands.Cog):
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"状況確認: `{prefix}schedule status <投稿IDまたはリンク>`\n"
             f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
+            f"締切設定: `{prefix}schedule deadline <投稿IDまたはリンク> 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
         )
@@ -1177,6 +1365,132 @@ class PollCog(commands.Cog):
             minimum,
         )
 
+    @schedule.command(name="deadline", description="開始時間投票の締切を設定します")
+    @app_commands.describe(
+        message="締切を設定する開始時間投票の投稿IDまたはリンク",
+        deadline="日本時間の YYYY-MM-DD HH:MM。解除は clear",
+    )
+    @commands.guild_only()
+    async def schedule_deadline(
+        self,
+        ctx: commands.Context,
+        message: str,
+        *,
+        deadline: str,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        try:
+            deadline_at = parse_schedule_deadline(deadline, now=self._utc_now())
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        missing_permissions = [
+            name
+            for name, enabled in {
+                "メッセージ履歴を読む": bot_permissions.read_message_history,
+                "埋め込みリンク": bot_permissions.embed_links,
+            }.items()
+            if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            await self._change_schedule_deadline(
+                ctx,
+                message_id,
+                deadline_at,
+            )
+
+    async def _change_schedule_deadline(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+        deadline_at: datetime | None,
+    ) -> None:
+        poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+        original_embed = poll_message.embeds[0]
+        registered_poll = self._registered_schedule_polls.get(message_id)
+        current_deadline = (
+            registered_poll.deadline_at
+            if registered_poll is not None
+            else schedule_deadline_at(original_embed)
+        )
+        if deadline_at is not None and not is_auto_start_schedule(original_embed):
+            await self._send_notice(
+                ctx,
+                "❌ 締切は自動判定中の時刻投票に設定してください",
+            )
+            return
+        if current_deadline == deadline_at and schedule_deadline_at(
+            original_embed
+        ) == deadline_at:
+            if deadline_at is None:
+                message_text = "ℹ️ 締切は設定されていません"
+            else:
+                message_text = (
+                    "ℹ️ 締切はすでに"
+                    f"{format_schedule_deadline(deadline_at)}です"
+                )
+            await self._send_notice(
+                ctx,
+                f"{message_text}\n{poll_message.jump_url}",
+            )
+            return
+
+        updated_embed = original_embed.copy()
+        set_schedule_deadline(updated_embed, deadline_at)
+        try:
+            await poll_message.edit(embed=updated_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("failed to edit schedule poll %s deadline", message_id)
+            await self._send_notice(ctx, "❌ 締切を変更できませんでした")
+            return
+
+        if deadline_at is None:
+            persisted = self._clear_schedule_poll_deadline(message_id)
+            action = "締切を解除しました"
+        else:
+            persisted = self._set_schedule_poll_deadline(
+                guild_id=ctx.guild.id,
+                channel_id=ctx.channel.id,
+                message_id=message_id,
+                deadline_at=deadline_at,
+            )
+            action = f"締切を{format_schedule_deadline(deadline_at)}に設定しました"
+        persistence_warning = (
+            "" if persisted else "\n⚠️ 再起動後に締切を復元できない可能性があります"
+        )
+        await self._send_notice(
+            ctx,
+            f"✅ {action}{persistence_warning}\n{poll_message.jump_url}",
+        )
+        logger.info(
+            "%s changed schedule poll %s deadline to %s",
+            ctx.author,
+            message_id,
+            deadline_at,
+        )
+
     @schedule.command(name="update", description="既存の開始時間投票を更新します")
     @app_commands.describe(
         message="更新する開始時間投票の投稿IDまたはリンク",
@@ -1243,6 +1557,12 @@ class PollCog(commands.Cog):
         self._invalidate_auto_start_check(message_id)
         original_embed = poll_message.embeds[0]
         active_announcement = start_announcement(original_embed)
+        registered_poll = self._registered_schedule_polls.get(message_id)
+        deadline_at = (
+            registered_poll.deadline_at
+            if registered_poll is not None
+            else schedule_deadline_at(original_embed)
+        )
         auto_start_enabled = normalize_auto_start_options(option_list) is not None
         minimum = auto_start_minimum(original_embed) or AUTO_START_THRESHOLD
         updated_embed = original_embed.copy()
@@ -1252,6 +1572,8 @@ class PollCog(commands.Cog):
             enabled=auto_start_enabled,
             minimum=minimum,
         )
+        if not auto_start_enabled:
+            set_schedule_deadline(updated_embed, None)
         try:
             await poll_message.edit(embed=updated_embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -1316,6 +1638,13 @@ class PollCog(commands.Cog):
                 channel_id=ctx.channel.id,
                 message_id=poll_message.id,
             )
+            if deadline_at is not None:
+                self._set_schedule_poll_deadline(
+                    guild_id=guild_id,
+                    channel_id=ctx.channel.id,
+                    message_id=poll_message.id,
+                    deadline_at=deadline_at,
+                )
             if getattr(self.bot, "user", None) is not None:
                 self._queue_auto_start_check_by_id(
                     guild_id=guild_id,
@@ -1377,62 +1706,79 @@ class PollCog(commands.Cog):
             poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
             if poll_message is None:
                 return
-
-            self._invalidate_auto_start_check(message_id)
-            original_embed = poll_message.embeds[0]
-            active_announcement = start_announcement(original_embed)
-            closed_embed = original_embed.copy()
-            mark_schedule_closed(closed_embed)
-            if closed_embed.title and not closed_embed.title.endswith("（終了）"):
-                closed_embed.title += "（終了）"
             try:
-                await poll_message.edit(embed=closed_embed)
+                cancellation_warning = await self._close_schedule_poll_message(
+                    ctx.channel,
+                    poll_message,
+                    cancellation_reason=(
+                        "投票が終了したため、この開始通知は取り消されました。"
+                    ),
+                    fallback_reason="投票が終了しました",
+                )
             except (discord.Forbidden, discord.HTTPException):
                 logger.exception("failed to close schedule poll %s", message_id)
                 self._resume_auto_start_check(ctx, poll_message)
                 await self._send_notice(ctx, "❌ 開始時間投票を終了できませんでした")
                 return
-
-            cancellation_warning = ""
-            if active_announcement is not None:
-                role = self._schedule_role(poll_message)
-                role_mention = self._schedule_role_mention(poll_message, role)
-                try:
-                    notification = await self._fetch_start_notification(
-                        ctx.channel,
-                        active_announcement,
-                    )
-                    if notification is not None:
-                        await notification.edit(
-                            content=(
-                                f"~~{format_start_label(active_announcement.start_time)} "
-                                f"{role_mention}~~\n"
-                                "↩️ 投票が終了したため、この開始通知は取り消されました。"
-                            ),
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                except (discord.Forbidden, discord.HTTPException):
-                    logger.exception(
-                        "failed to cancel start notification while closing poll %s",
-                        message_id,
-                    )
-                    if not await self._post_public_cancellation_fallback(
-                        ctx.channel,
-                        active_announcement,
-                        role_mention,
-                        "投票が終了しました",
-                    ):
-                        cancellation_warning = (
-                            "\n⚠️ 以前の開始通知を取消表示に更新できませんでした"
-                        )
-
-            self._unregister_schedule_poll(message_id)
             await self._send_notice(
                 ctx,
                 "✅ 開始時間投票を終了しました"
                 f"{cancellation_warning}\n{poll_message.jump_url}",
             )
             logger.info("%s closed schedule poll %s", ctx.author, message_id)
+
+    async def _close_schedule_poll_message(
+        self,
+        channel,
+        poll_message: discord.Message,
+        *,
+        cancellation_reason: str,
+        fallback_reason: str,
+    ) -> str:
+        message_id = poll_message.id
+        self._invalidate_auto_start_check(message_id)
+        original_embed = poll_message.embeds[0]
+        active_announcement = start_announcement(original_embed)
+        closed_embed = original_embed.copy()
+        mark_schedule_closed(closed_embed)
+        if closed_embed.title and not closed_embed.title.endswith("（終了）"):
+            closed_embed.title += "（終了）"
+        await poll_message.edit(embed=closed_embed)
+
+        cancellation_warning = ""
+        if active_announcement is not None:
+            role = self._schedule_role(poll_message)
+            role_mention = self._schedule_role_mention(poll_message, role)
+            try:
+                notification = await self._fetch_start_notification(
+                    channel,
+                    active_announcement,
+                )
+                if notification is not None:
+                    await notification.edit(
+                        content=(
+                            f"~~{format_start_label(active_announcement.start_time)} "
+                            f"{role_mention}~~\n↩️ {cancellation_reason}"
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "failed to cancel start notification while closing poll %s",
+                    message_id,
+                )
+                if not await self._post_public_cancellation_fallback(
+                    channel,
+                    active_announcement,
+                    role_mention,
+                    fallback_reason,
+                ):
+                    cancellation_warning = (
+                        "\n⚠️ 以前の開始通知を取消表示に更新できませんでした"
+                    )
+
+        self._unregister_schedule_poll(message_id)
+        return cancellation_warning
 
     async def _fetch_schedule_poll(
         self,
@@ -1488,7 +1834,13 @@ class PollCog(commands.Cog):
         channel_id: int,
         message_id: int,
     ) -> None:
-        poll = RegisteredSchedulePoll(guild_id, channel_id, message_id)
+        existing_poll = self._registered_schedule_polls.get(message_id)
+        poll = RegisteredSchedulePoll(
+            guild_id,
+            channel_id,
+            message_id,
+            existing_poll.deadline_at if existing_poll is not None else None,
+        )
         self._registered_schedule_ids.add(message_id)
         self._registered_schedule_polls[message_id] = poll
         if message_id in self._persisted_schedule_ids:
@@ -1505,6 +1857,62 @@ class PollCog(commands.Cog):
                 "failed to register schedule poll %s for restart recovery",
                 message_id,
             )
+
+    def _set_schedule_poll_deadline(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        deadline_at: datetime,
+    ) -> bool:
+        poll = RegisteredSchedulePoll(
+            guild_id,
+            channel_id,
+            message_id,
+            deadline_at,
+        )
+        self._registered_schedule_ids.add(message_id)
+        self._registered_schedule_polls[message_id] = poll
+        persisted = True
+        try:
+            self._schedule_registry.set_deadline(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                deadline_at=deadline_at,
+            )
+            self._persisted_schedule_ids.add(message_id)
+        except (sqlite3.Error, OSError):
+            persisted = False
+            logger.exception(
+                "failed to persist schedule poll %s deadline",
+                message_id,
+            )
+        self._queue_schedule_deadline(poll)
+        return persisted
+
+    def _clear_schedule_poll_deadline(self, message_id: int) -> bool:
+        poll = self._registered_schedule_polls.get(message_id)
+        if poll is not None:
+            self._registered_schedule_polls[message_id] = RegisteredSchedulePoll(
+                poll.guild_id,
+                poll.channel_id,
+                poll.message_id,
+                None,
+            )
+        deadline_task = self._deadline_tasks.pop(message_id, None)
+        if deadline_task is not None:
+            deadline_task.cancel()
+        try:
+            self._schedule_registry.clear_deadline(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to clear schedule poll %s deadline",
+                message_id,
+            )
+            return False
+        return True
 
     def _prune_expired_schedule_polls(
         self,
@@ -1532,6 +1940,7 @@ class PollCog(commands.Cog):
                 poll.message_id: poll
                 for poll in self._registered_schedule_polls.values()
                 if poll.message_id < cutoff_message_id
+                and poll.deadline_at is None
             }
         )
         expired_polls = [
@@ -1546,6 +1955,9 @@ class PollCog(commands.Cog):
             self._invalidate_auto_start_check(poll.message_id)
             self._persisted_schedule_ids.discard(poll.message_id)
             self._registered_schedule_polls.pop(poll.message_id, None)
+            deadline_task = self._deadline_tasks.pop(poll.message_id, None)
+            if deadline_task is not None:
+                deadline_task.cancel()
             self._forget_start_notification(poll.message_id)
             self._last_cancelled_user_ids.pop(poll.message_id, None)
             self._start_notified_poll_ids.discard(poll.message_id)
@@ -1560,6 +1972,14 @@ class PollCog(commands.Cog):
     def _unregister_schedule_poll(self, message_id: int) -> None:
         self._registered_schedule_ids.discard(message_id)
         self._registered_schedule_polls.pop(message_id, None)
+        deadline_task = self._deadline_tasks.pop(message_id, None)
+        if deadline_task is not None:
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if deadline_task is not current_task:
+                deadline_task.cancel()
         self._forget_start_notification(message_id)
         self._last_cancelled_user_ids.pop(message_id, None)
         self._start_notified_poll_ids.discard(message_id)
@@ -1570,6 +1990,114 @@ class PollCog(commands.Cog):
             self._persisted_schedule_ids.discard(message_id)
         except (sqlite3.Error, OSError):
             logger.exception("failed to unregister schedule poll %s", message_id)
+
+    def _queue_schedule_deadline(self, poll: RegisteredSchedulePoll) -> None:
+        if poll.deadline_at is None:
+            return
+        previous_task = self._deadline_tasks.get(poll.message_id)
+        if previous_task is not None:
+            previous_task.cancel()
+        task = asyncio.create_task(
+            self._run_schedule_deadline(poll),
+            name=f"schedule-deadline-{poll.message_id}",
+        )
+        self._deadline_tasks[poll.message_id] = task
+        task.add_done_callback(
+            lambda completed, message_id=poll.message_id: (
+                self._deadline_tasks.pop(message_id, None)
+                if self._deadline_tasks.get(message_id) is completed
+                else None
+            )
+        )
+
+    async def _run_schedule_deadline(
+        self,
+        poll: RegisteredSchedulePoll,
+    ) -> None:
+        deadline_at = poll.deadline_at
+        if deadline_at is None:
+            return
+        delay = max(
+            0.0,
+            (deadline_at - self._utc_now()).total_seconds(),
+        )
+        try:
+            await self._deadline_sleep(delay)
+            for attempt in range(AUTO_START_MAX_RETRIES + 1):
+                if self._registered_schedule_polls.get(poll.message_id) != poll:
+                    return
+                lock = self._auto_start_locks.setdefault(
+                    poll.message_id,
+                    asyncio.Lock(),
+                )
+                try:
+                    async with lock:
+                        if self._registered_schedule_polls.get(poll.message_id) != poll:
+                            return
+                        await self._close_schedule_poll_at_deadline(poll)
+                    return
+                except discord.NotFound:
+                    self._unregister_schedule_poll(poll.message_id)
+                    return
+                except discord.Forbidden:
+                    logger.exception(
+                        "forbidden while closing schedule poll %s at deadline",
+                        poll.message_id,
+                    )
+                    self._queue_auto_start_check_by_id(
+                        guild_id=poll.guild_id,
+                        channel_id=poll.channel_id,
+                        message_id=poll.message_id,
+                    )
+                    return
+                except discord.HTTPException:
+                    if attempt >= AUTO_START_MAX_RETRIES:
+                        logger.exception(
+                            "failed to close schedule poll %s at deadline",
+                            poll.message_id,
+                        )
+                        self._queue_auto_start_check_by_id(
+                            guild_id=poll.guild_id,
+                            channel_id=poll.channel_id,
+                            message_id=poll.message_id,
+                        )
+                        return
+                    await self._retry_sleep(
+                        AUTO_START_NOTICE_RETRY_DELAY_SECONDS
+                    )
+        except asyncio.CancelledError:
+            raise
+
+    async def _close_schedule_poll_at_deadline(
+        self,
+        poll: RegisteredSchedulePoll,
+    ) -> None:
+        channel = self.bot.get_channel(poll.channel_id)
+        if channel is None:
+            channel = await self.bot.fetch_channel(poll.channel_id)
+        if not hasattr(channel, "fetch_message"):
+            self._unregister_schedule_poll(poll.message_id)
+            return
+        poll_message = await channel.fetch_message(poll.message_id)
+        bot_user = self.bot.user
+        if (
+            bot_user is None
+            or poll_message.author.id != bot_user.id
+            or not poll_message.embeds
+            or schedule_author_id(poll_message.embeds[0]) is None
+        ):
+            self._unregister_schedule_poll(poll.message_id)
+            return
+        if is_schedule_closed(poll_message.embeds[0]):
+            self._unregister_schedule_poll(poll.message_id)
+            return
+        await self._close_schedule_poll_message(
+            channel,
+            poll_message,
+            cancellation_reason="締切時刻になったため、この開始通知は取り消されました。",
+            fallback_reason="投票の締切時刻になりました",
+        )
+        logger.info("closed schedule poll %s at deadline", poll.message_id)
 
     def _remember_start_notification(
         self,
@@ -2516,6 +3044,20 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule minimum <投稿IDまたはリンク> <1〜999>`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_deadline.error
+    async def schedule_deadline_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule deadline <投稿IDまたはリンク> YYYY-MM-DD HH:MM`\n"
+                "解除する場合: `/schedule deadline <投稿IDまたはリンク> clear`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):

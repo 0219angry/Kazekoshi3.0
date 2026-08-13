@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -23,17 +24,22 @@ from kazekoshi.cogs.poll import (
     build_schedule_embed,
     build_schedule_status_embed,
     choose_start_time,
+    format_schedule_deadline,
     format_schedule_options,
     is_auto_start_schedule,
+    is_schedule_closed,
     mark_start_time_announced,
     normalize_schedule_time,
     parse_schedule_add_options,
+    parse_schedule_deadline,
     parse_message_id,
     parse_schedule_options,
     schedule_author_id,
+    schedule_deadline_at,
     schedule_option_emojis,
     schedule_options_from_embed,
     set_auto_start_minimum,
+    set_schedule_deadline,
     start_announcement,
 )
 
@@ -333,6 +339,28 @@ class ScheduleParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleInputError, "投稿ID"):
             parse_message_id("not-a-message")
 
+    def test_parse_deadline_uses_japan_time_and_supports_clear(self):
+        expected = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            parse_schedule_deadline("2026-08-14 19:00", now=FIXED_NOW),
+            expected,
+        )
+        self.assertEqual(
+            parse_schedule_deadline("2026/08/14 19:00", now=FIXED_NOW),
+            expected,
+        )
+        self.assertIsNone(parse_schedule_deadline("解除", now=FIXED_NOW))
+        self.assertIsNone(parse_schedule_deadline("CLEAR", now=FIXED_NOW))
+
+    def test_parse_deadline_rejects_past_invalid_and_too_distant_values(self):
+        with self.assertRaisesRegex(ScheduleInputError, "現在より後"):
+            parse_schedule_deadline("2026-08-10 08:59", now=FIXED_NOW)
+        with self.assertRaisesRegex(ScheduleInputError, "YYYY-MM-DD"):
+            parse_schedule_deadline("tomorrow", now=FIXED_NOW)
+        with self.assertRaisesRegex(ScheduleInputError, "90日以内"):
+            parse_schedule_deadline("2026-11-09 09:01", now=FIXED_NOW)
+
     def test_choose_start_time_counts_distinct_people_from_early_time(self):
         voters = {
             "20:00": set(),
@@ -483,6 +511,27 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertIn("3️⃣21:00: 2票（累計5人）", status.description)
         self.assertIn("🆖NG: 2票", status.description)
 
+    def test_deadline_field_can_be_set_read_and_cleared(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(
+            role,
+            ["20:00", "21:00", "NG"],
+            author,
+            auto_start=True,
+        )
+        deadline_at = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+
+        set_schedule_deadline(embed, deadline_at)
+
+        self.assertEqual(schedule_deadline_at(embed), deadline_at)
+        self.assertEqual(
+            next(field.value for field in embed.fields if field.name == "締切"),
+            format_schedule_deadline(deadline_at),
+        )
+        set_schedule_deadline(embed, None)
+        self.assertIsNone(schedule_deadline_at(embed))
+
     def test_legacy_multiline_options_remain_readable(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
@@ -515,7 +564,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         application_commands = PollCog.schedule.app_command.commands
         self.assertEqual(
             [command.name for command in application_commands],
-            ["add", "status", "minimum", "update", "close"],
+            ["add", "status", "minimum", "deadline", "update", "close"],
         )
         add_command = application_commands[0]
         options_parameter = next(
@@ -555,6 +604,75 @@ class SchedulePollRegistryTests(unittest.TestCase):
             {cutoff_id, recent_id},
         )
 
+    def test_deadline_round_trips_and_regular_registration_preserves_it(self):
+        message_id = schedule_snowflake(FIXED_NOW - timedelta(days=1))
+        deadline_at = FIXED_NOW + timedelta(days=2)
+
+        self.registry.set_deadline(
+            guild_id=1,
+            channel_id=10,
+            message_id=message_id,
+            deadline_at=deadline_at,
+        )
+        self.registry.register(
+            guild_id=1,
+            channel_id=11,
+            message_id=message_id,
+        )
+
+        stored = self.registry.all()[0]
+        self.assertEqual(stored.channel_id, 11)
+        self.assertEqual(stored.deadline_at, deadline_at)
+        self.registry.clear_deadline(message_id)
+        self.assertIsNone(self.registry.all()[0].deadline_at)
+
+    def test_prune_preserves_poll_with_deadline(self):
+        cutoff_id = schedule_snowflake(FIXED_NOW - timedelta(days=90))
+        old_id = schedule_snowflake(FIXED_NOW - timedelta(days=100))
+        self.registry.set_deadline(
+            guild_id=1,
+            channel_id=10,
+            message_id=old_id,
+            deadline_at=FIXED_NOW + timedelta(days=1),
+        )
+
+        self.assertEqual(self.registry.prune_before(cutoff_id), [])
+        self.assertEqual(self.registry.all()[0].message_id, old_id)
+
+    def test_existing_registry_schema_is_migrated_for_deadlines(self):
+        database_path = f"{self.temp_directory.name}/legacy-schedule-polls.sqlite3"
+        message_id = schedule_snowflake(FIXED_NOW - timedelta(days=1))
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE schedule_polls (
+                    message_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO schedule_polls (message_id, guild_id, channel_id)
+                VALUES (?, ?, ?)
+                """,
+                (message_id, 1, 10),
+            )
+        registry = SchedulePollRegistry(database_path)
+
+        registry.set_deadline(
+            guild_id=1,
+            channel_id=10,
+            message_id=message_id,
+            deadline_at=FIXED_NOW + timedelta(days=1),
+        )
+
+        self.assertEqual(
+            registry.all()[0].deadline_at,
+            FIXED_NOW + timedelta(days=1),
+        )
+
 
 class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -572,7 +690,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(schedule_group)
             self.assertEqual(
                 [command.name for command in schedule_group.commands],
-                ["add", "status", "minimum", "update", "close"],
+                ["add", "status", "minimum", "deadline", "update", "close"],
             )
         finally:
             await bot.close()
@@ -842,11 +960,91 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1️⃣20:00: 1票", sent.kwargs["embed"].description)
         poll_message.edit.assert_not_awaited()
 
+    async def test_deadline_sets_and_clears_persisted_deadline(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(
+            bot,
+            now_provider=lambda: FIXED_NOW,
+            registry=self.registry,
+        )
+        cog._queue_schedule_deadline = Mock()
+        role = SimpleNamespace(name="RAID")
+        poll_message = SimpleNamespace(
+            id=99,
+            author=bot_user,
+            embeds=[
+                build_schedule_embed(
+                    role,
+                    ["20:00", "21:00", "NG"],
+                    creator,
+                    auto_start=True,
+                )
+            ],
+            jump_url="https://discord.com/channels/1/10/99",
+            edit=AsyncMock(),
+        )
+
+        async def save_poll_edit(*, embed):
+            poll_message.embeds = [embed]
+            return poll_message
+
+        poll_message.edit.side_effect = save_poll_edit
+        bot_permissions = SimpleNamespace(
+            read_message_history=True,
+            embed_links=True,
+        )
+        creator_permissions = SimpleNamespace(manage_messages=False)
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else creator_permissions
+
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=permissions_for,
+            fetch_message=AsyncMock(return_value=poll_message),
+        )
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=creator,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_deadline.callback(
+            cog,
+            ctx,
+            "99",
+            deadline="2026-08-14 19:00",
+        )
+
+        expected = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        self.assertEqual(schedule_deadline_at(poll_message.embeds[0]), expected)
+        self.assertEqual(self.registry.all()[0].deadline_at, expected)
+        cog._queue_schedule_deadline.assert_called_once()
+        self.assertIn("締切を", ctx.send.await_args.args[0])
+
+        ctx.send.reset_mock()
+        await PollCog.schedule_deadline.callback(
+            cog,
+            ctx,
+            "99",
+            deadline="clear",
+        )
+
+        self.assertIsNone(schedule_deadline_at(poll_message.embeds[0]))
+        self.assertIsNone(self.registry.all()[0].deadline_at)
+        self.assertIn("締切を解除", ctx.send.await_args.args[0])
+
     async def test_update_edits_embed_and_resets_reactions(self):
         bot_user = SimpleNamespace(id=1)
         bot = SimpleNamespace(user=bot_user)
         cog = PollCog(bot, registry=self.registry)
         cog._queue_auto_start_check_by_id = Mock()
+        cog._queue_schedule_deadline = Mock()
         permissions = SimpleNamespace(
             mention_everyone=True,
             manage_messages=True,
@@ -862,6 +1060,14 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             author,
             auto_start=True,
             minimum=3,
+        )
+        deadline_at = FIXED_NOW + timedelta(days=1)
+        set_schedule_deadline(original_embed, deadline_at)
+        cog._set_schedule_poll_deadline(
+            guild_id=1,
+            channel_id=10,
+            message_id=99,
+            deadline_at=deadline_at,
         )
         poll_message = SimpleNamespace(
             id=99,
@@ -921,6 +1127,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(is_auto_start_schedule(edited_embed))
         self.assertEqual(auto_start_minimum(edited_embed), 3)
+        self.assertEqual(schedule_deadline_at(edited_embed), deadline_at)
         self.assertEqual(edited_embed.title, "📅 VALORANT 開始時間 [3人]")
         self.assertIsNone(announced_start_time(edited_embed))
         self.assertEqual(
@@ -932,7 +1139,10 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             channel_id=10,
             message_id=99,
         )
-        self.assertEqual([poll.message_id for poll in self.registry.all()], [99])
+        registered = self.registry.all()
+        self.assertEqual([poll.message_id for poll in registered], [99])
+        self.assertEqual(registered[0].deadline_at, deadline_at)
+        self.assertEqual(cog._queue_schedule_deadline.call_count, 2)
         self.assertIn("投票をリセット", ctx.send.await_args.args[0])
 
     async def test_prefix_add_requires_an_actual_role_mention(self):
@@ -1340,6 +1550,30 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             old_notification.id,
             self.harness.cog._notification_poll_refs,
+        )
+
+    async def test_cog_load_recovers_persisted_deadline(self):
+        deadline_at = FIXED_NOW + timedelta(hours=1)
+        self.registry.set_deadline(
+            guild_id=1,
+            channel_id=self.harness.CHANNEL_ID,
+            message_id=self.harness.POLL_MESSAGE_ID,
+            deadline_at=deadline_at,
+        )
+        deadline_sleeper = ControlledSleeper()
+        self.harness.cog._deadline_sleep = deadline_sleeper
+        self.harness.cog._now = lambda: FIXED_NOW
+
+        await self.harness.cog.cog_load()
+        await self.harness.cog._registry_recovery_task
+        await deadline_sleeper.wait_for_calls(1)
+
+        self.assertEqual(deadline_sleeper.calls[0].delay, 3600)
+        self.assertEqual(
+            self.harness.cog._registered_schedule_polls[
+                self.harness.POLL_MESSAGE_ID
+            ].deadline_at,
+            deadline_at,
         )
 
     async def test_cog_load_recovers_registered_poll_after_ten_second_grace(self):
@@ -2200,6 +2434,43 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             self.harness.channel.send.await_args.kwargs["content"],
             "20:00 開始 <@&88>",
         )
+
+    async def test_deadline_survives_registry_and_closes_active_poll(self):
+        old_notification = await self.announce(
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
+        )
+        deadline_sleeper = ControlledSleeper()
+        self.harness.cog._deadline_sleep = deadline_sleeper
+        self.harness.cog._now = lambda: FIXED_NOW
+        deadline_at = FIXED_NOW + timedelta(hours=1)
+        updated_embed = self.harness.poll_message.embeds[0].copy()
+        set_schedule_deadline(updated_embed, deadline_at)
+        self.harness.poll_message.embeds = [updated_embed]
+
+        persisted = self.harness.cog._set_schedule_poll_deadline(
+            guild_id=1,
+            channel_id=self.harness.CHANNEL_ID,
+            message_id=self.harness.POLL_MESSAGE_ID,
+            deadline_at=deadline_at,
+        )
+        await deadline_sleeper.wait_for_calls(1)
+        deadline_task = self.harness.cog._deadline_tasks[
+            self.harness.POLL_MESSAGE_ID
+        ]
+
+        self.assertTrue(persisted)
+        self.assertEqual(deadline_sleeper.calls[0].delay, 3600)
+        self.assertEqual(self.registry.all()[0].deadline_at, deadline_at)
+
+        deadline_sleeper.release()
+        await deadline_task
+
+        closed_embed = self.harness.poll_message.embeds[0]
+        self.assertTrue(is_schedule_closed(closed_embed))
+        self.assertEqual(closed_embed.title, "📅 GAME 開始時間 [5人]（終了）")
+        self.assertIn("締切時刻", old_notification.content)
+        self.assertEqual(self.registry.all(), [])
 
     async def test_schedule_close_disables_poll_and_cancels_active_notification(self):
         old_notification = await self.announce(
