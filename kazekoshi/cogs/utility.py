@@ -94,6 +94,7 @@ HELP_SECTIONS = {
             ("{p}schedule minimum [投稿ID] [人数]", "既存票を残して最低人数を変更"),
             ("{p}schedule deadline [投稿ID] [日時]", "日本時間の締切を設定・解除"),
             ("{p}schedule update [投稿ID] [候補...]", "開始時間投票を更新・票をリセット"),
+            ("{p}schedule decide [投稿ID] [時刻]", "候補から開始時間を手動確定"),
             ("{p}schedule close [投稿ID]", "開始時間投票の自動判定を終了"),
             ("{p}userinfo [メンバー]",  "ユーザー情報を表示"),
             ("{p}serverinfo",           "サーバー情報を表示"),

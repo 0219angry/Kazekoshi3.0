@@ -68,6 +68,7 @@ SCHEDULE_TIMEZONE = ZoneInfo("Asia/Tokyo")
 SCHEDULE_DEADLINE_MAX_DAYS = 90
 SCHEDULE_DEADLINE_FIELD_NAME = "締切"
 SCHEDULE_DEADLINE_VALUE_PATTERN = re.compile(r"<t:(?P<timestamp>\d+):F>")
+SCHEDULE_DECISION_FIELD_NAME = "確定開始"
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -569,6 +570,52 @@ def set_schedule_deadline(
         )
 
 
+def schedule_decided_start_time(embed: discord.Embed) -> str | None:
+    for field in embed.fields:
+        if field.name != SCHEDULE_DECISION_FIELD_NAME:
+            continue
+        value = field.value.strip()
+        if value.endswith("開始"):
+            value = value[:-len("開始")].strip()
+        return normalize_schedule_time(value)
+    return None
+
+
+def set_schedule_decision(
+    embed: discord.Embed,
+    start_time: str | None,
+) -> None:
+    field_index = next(
+        (
+            index
+            for index, field in enumerate(embed.fields)
+            if field.name == SCHEDULE_DECISION_FIELD_NAME
+        ),
+        None,
+    )
+    if start_time is None:
+        if field_index is not None:
+            embed.remove_field(field_index)
+        return
+    normalized_time = normalize_schedule_time(start_time)
+    if normalized_time is None:
+        raise ValueError("invalid schedule decision time")
+    value = format_start_label(normalized_time)
+    if field_index is None:
+        embed.add_field(
+            name=SCHEDULE_DECISION_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
+    else:
+        embed.set_field_at(
+            field_index,
+            name=SCHEDULE_DECISION_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
+
+
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
     options = schedule_options_from_embed(embed)
     return (
@@ -831,9 +878,14 @@ def build_schedule_status_embed(
 
     minimum = schedule_minimum(source_embed)
     auto_start_enabled = is_auto_start_schedule(source_embed)
+    decided_start_time = schedule_decided_start_time(source_embed)
     if is_schedule_closed(source_embed):
-        state = "⚫ 終了済み"
-        color = discord.Color.dark_grey()
+        if decided_start_time is not None:
+            state = "✅ 確定済み"
+            color = discord.Color.green()
+        else:
+            state = "⚫ 終了済み"
+            color = discord.Color.dark_grey()
     elif auto_start_enabled:
         state = "🟢 自動判定中"
         color = discord.Color.green()
@@ -842,6 +894,8 @@ def build_schedule_status_embed(
         color = discord.Color.blue()
 
     summary = [f"状態: {state}"]
+    if decided_start_time is not None:
+        summary.append(f"確定開始: {format_start_label(decided_start_time)}")
     if minimum is not None:
         summary.append(f"最低人数: {minimum}人")
     deadline_at = schedule_deadline_at(source_embed)
@@ -1021,6 +1075,7 @@ class PollCog(commands.Cog):
             f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
             f"締切設定: `{prefix}schedule deadline <投稿IDまたはリンク> 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
+            f"確定: `{prefix}schedule decide <投稿IDまたはリンク> 21:00`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
         )
 
@@ -1634,8 +1689,15 @@ class PollCog(commands.Cog):
         if poll_message is None:
             return
 
-        self._invalidate_auto_start_check(message_id)
         original_embed = poll_message.embeds[0]
+        if is_schedule_closed(original_embed):
+            await self._send_notice(
+                ctx,
+                "❌ 終了済みの開始時間投票は更新できません。cloneで新しい投票を作成してください",
+            )
+            return
+
+        self._invalidate_auto_start_check(message_id)
         active_announcement = start_announcement(original_embed)
         registered_poll = self._registered_schedule_polls.get(message_id)
         deadline_at = (
@@ -1738,6 +1800,256 @@ class PollCog(commands.Cog):
             f"{cancellation_warning}\n{poll_message.jump_url}",
         )
         logger.info("%s updated schedule poll %s", ctx.author, message_id)
+
+    @schedule.command(name="decide", description="開始時間を手動で確定します")
+    @app_commands.describe(
+        message="確定する開始時間投票の投稿IDまたはリンク",
+        time="候補に含まれる開始時刻（例: 21:00）",
+    )
+    @commands.guild_only()
+    async def schedule_decide(
+        self,
+        ctx: commands.Context,
+        message: str,
+        time: str,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        decided_start_time = normalize_schedule_time(time)
+        if decided_start_time is None:
+            await self._send_notice(
+                ctx,
+                "❌ 開始時刻は `21`、`21:00`、`2100` のいずれかの形式で指定してください",
+            )
+            return
+        try:
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        can_send = (
+            bot_permissions.send_messages_in_threads
+            if isinstance(ctx.channel, discord.Thread)
+            else bot_permissions.send_messages
+        )
+        missing_permissions = [
+            name
+            for name, enabled in {
+                "メッセージの送信": can_send,
+                "メッセージ履歴を読む": bot_permissions.read_message_history,
+                "埋め込みリンク": bot_permissions.embed_links,
+            }.items()
+            if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            await self._decide_schedule_message(
+                ctx,
+                message_id,
+                decided_start_time,
+            )
+
+    async def _decide_schedule_message(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+        decided_start_time: str,
+    ) -> None:
+        poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+        original_embed = poll_message.embeds[0]
+        existing_decision = schedule_decided_start_time(original_embed)
+        if is_schedule_closed(original_embed):
+            if existing_decision is not None:
+                await self._send_notice(
+                    ctx,
+                    "ℹ️ この投票はすでに"
+                    f"{format_start_label(existing_decision)}で確定しています\n"
+                    f"{poll_message.jump_url}",
+                )
+            else:
+                await self._send_notice(ctx, "❌ この開始時間投票は終了済みです")
+            return
+
+        options = schedule_options_from_embed(original_embed)
+        candidate_times = (
+            [
+                normalized
+                for option in options
+                if (normalized := normalize_schedule_time(option)) is not None
+            ]
+            if options is not None
+            else []
+        )
+        if decided_start_time not in candidate_times:
+            candidates = "、".join(candidate_times) or "なし"
+            await self._send_notice(
+                ctx,
+                "❌ 確定する時刻は投票の候補から指定してください"
+                f"（時刻候補: {candidates}）",
+            )
+            return
+
+        announcement = start_announcement(original_embed)
+        already_notified = (
+            has_announced_start_before(original_embed)
+            or message_id in self._start_notified_poll_ids
+        )
+        role = self._schedule_role(poll_message)
+        if role is None and not already_notified:
+            await self._send_notice(
+                ctx,
+                "❌ 対象ロールが削除されているため開始通知を送れません",
+            )
+            return
+        if (
+            role is not None
+            and not already_notified
+            and not getattr(role, "mentionable", True)
+        ):
+            author_permissions = ctx.channel.permissions_for(ctx.author)
+            bot_permissions = ctx.channel.permissions_for(ctx.guild.me)
+            if not author_permissions.mention_everyone:
+                await self._send_notice(
+                    ctx,
+                    "❌ メンション不可のロールを通知する権限がありません",
+                )
+                return
+            if not bot_permissions.mention_everyone:
+                await self._send_notice(
+                    ctx,
+                    "❌ Botに「@everyone、@here、すべてのロールにメンション」の権限が必要です",
+                )
+                return
+
+        self._invalidate_auto_start_check(message_id)
+        role_mention = self._schedule_role_mention(poll_message, role)
+        old_notification = None
+        new_notification = None
+        old_notification_changed = False
+        sent_first_ping = False
+        try:
+            old_notification = await self._fetch_start_notification(
+                ctx.channel,
+                announcement,
+            )
+            reused_notification = (
+                announcement is not None
+                and announcement.start_time == decided_start_time
+                and old_notification is not None
+            )
+            if old_notification is not None and announcement is not None:
+                if reused_notification:
+                    content = (
+                        f"{format_start_label(decided_start_time)} {role_mention}\n"
+                        "✅ この時間で確定しました。"
+                    )
+                else:
+                    content = (
+                        f"~~{format_start_label(announcement.start_time)} "
+                        f"{role_mention}~~\n"
+                        "↪️ 手動確定により、"
+                        f"{format_start_label(decided_start_time)}へ変更されました。"
+                    )
+                try:
+                    await old_notification.edit(
+                        content=content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    old_notification_changed = True
+                except discord.NotFound:
+                    old_notification = None
+                    reused_notification = False
+
+            if not reused_notification:
+                allowed_mentions = (
+                    discord.AllowedMentions.none()
+                    if already_notified
+                    else discord.AllowedMentions(
+                        everyone=False,
+                        users=False,
+                        roles=[role] if role is not None else False,
+                        replied_user=False,
+                    )
+                )
+                new_notification = await ctx.channel.send(
+                    content=(
+                        f"{format_start_label(decided_start_time)} {role_mention}\n"
+                        "✅ この時間で確定しました。"
+                    ),
+                    allowed_mentions=allowed_mentions,
+                )
+                if not already_notified:
+                    sent_first_ping = True
+                    self._start_notified_poll_ids.add(message_id)
+
+            decided_embed = original_embed.copy()
+            set_schedule_decision(decided_embed, decided_start_time)
+            set_schedule_deadline(decided_embed, None)
+            mark_schedule_closed(decided_embed)
+            if decided_embed.title and not decided_embed.title.endswith("（終了）"):
+                decided_embed.title += "（終了）"
+            await poll_message.edit(embed=decided_embed)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.exception("failed to decide schedule poll %s", message_id)
+            if new_notification is not None:
+                try:
+                    await new_notification.delete()
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    logger.exception(
+                        "failed to remove incomplete decision notification for poll %s",
+                        message_id,
+                    )
+            if old_notification_changed:
+                await self._restore_start_notification(
+                    old_notification,
+                    announcement,
+                    role_mention,
+                )
+            if sent_first_ping:
+                history_embed = original_embed.copy()
+                mark_start_notification_history(history_embed)
+                try:
+                    await poll_message.edit(embed=history_embed)
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    logger.exception(
+                        "failed to persist notification history after decision failure for poll %s",
+                        message_id,
+                    )
+            self._resume_auto_start_check(ctx, poll_message)
+            await self._send_notice(ctx, "❌ 開始時間を確定できませんでした")
+            return
+
+        self._unregister_schedule_poll(message_id)
+        await self._send_notice(
+            ctx,
+            f"✅ {format_start_label(decided_start_time)}で確定しました\n"
+            f"{poll_message.jump_url}",
+        )
+        logger.info(
+            "%s decided schedule poll %s at %s",
+            ctx.author,
+            message_id,
+            decided_start_time,
+        )
 
     @schedule.command(name="close", description="開始時間投票の自動判定を終了します")
     @app_commands.describe(
@@ -3151,6 +3463,19 @@ class PollCog(commands.Cog):
                 ctx,
                 "❌ 使い方: `/schedule deadline <投稿IDまたはリンク> YYYY-MM-DD HH:MM`\n"
                 "解除する場合: `/schedule deadline <投稿IDまたはリンク> clear`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_decide.error
+    async def schedule_decide_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule decide <投稿IDまたはリンク> <候補の時刻>`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
