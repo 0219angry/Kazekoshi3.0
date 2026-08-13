@@ -33,7 +33,6 @@ try:
     config.read("config.ini", encoding="UTF-8")
     DISCORD_TOKEN = config["DEFAULT"]["DISCORD_TOKEN"]
     COMMAND_PREFIX = config["DEFAULT"].get("COMMAND_PREFIX", "!")
-    VALORANT_CHANNEL_ID = config["DEFAULT"].getint("VALORANT_CHANNEL_ID", fallback=0)
 except Exception:
     logger.exception("config.ini の読み込みに失敗しました")
     sys.exit(1)
@@ -74,7 +73,6 @@ class KazekoshiBot(commands.Bot):
 
 intents = discord.Intents.all()
 bot = KazekoshiBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
-bot.valorant_channel_id = VALORANT_CHANNEL_ID
 
 try:
     bot.run(DISCORD_TOKEN)

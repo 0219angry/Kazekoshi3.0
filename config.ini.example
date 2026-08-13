@@ -2,10 +2,6 @@
 # ─── Discord ─────────────────────────────────────────────────────
 DISCORD_TOKEN      = your_discord_bot_token_here
 COMMAND_PREFIX     = !
-# /schedule を許可する #valorant のチャンネルID
-# 0 の場合は、名前が "valorant" のチャンネルを使用します
-VALORANT_CHANNEL_ID = 0
-
 # ─── VOICEVOX ────────────────────────────────────────────────────
 # デフォルトの話者ID（3 = ずんだもんノーマル）
 SPEAKER_ID         = 3

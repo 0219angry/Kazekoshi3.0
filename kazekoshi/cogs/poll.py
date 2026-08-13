@@ -18,7 +18,6 @@ from discord.ext import commands
 logger = getLogger(__name__)
 EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 EMOJI_NG = "🆖"
-SCHEDULE_CHANNEL_NAME = "valorant"
 SCHEDULE_TITLE_PREFIX = "📅 "
 SCHEDULE_FOOTER_PATTERN = re.compile(r"\|\s*作成者ID:\s*(\d+)\s*$")
 MESSAGE_LINK_PATTERN = re.compile(
@@ -498,24 +497,6 @@ def choose_start_time(voters_by_option: dict[str, set[int]]) -> str | None:
     return None
 
 
-def is_schedule_channel_target(bot, channel) -> bool:
-    """設定されたチャンネル、または #valorant とそのスレッドか判定する。"""
-    # TextChannel.parent はカテゴリなので、スレッドの場合だけ親チャンネルを許可する。
-    target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
-    if target_channel is None:
-        return False
-    configured_id = getattr(bot, "valorant_channel_id", 0)
-
-    if configured_id:
-        return target_channel.id == configured_id
-    return getattr(target_channel, "name", "").casefold() == SCHEDULE_CHANNEL_NAME
-
-
-def is_schedule_channel(ctx: commands.Context) -> bool:
-    """コマンドの実行先が開始時間投票用チャンネルか判定する。"""
-    return is_schedule_channel_target(ctx.bot, ctx.channel)
-
-
 def build_schedule_embed(
     role: discord.Role,
     options: list[str],
@@ -644,7 +625,7 @@ class PollCog(commands.Cog):
 
     @commands.hybrid_group(
         name="schedule",
-        description="VALORANTの開始時間投票を管理します",
+        description="ロールの開始時間投票を管理します",
         invoke_without_command=True,
     )
     @commands.guild_only()
@@ -652,7 +633,7 @@ class PollCog(commands.Cog):
         prefix = ctx.clean_prefix or "/"
         await ctx.send(
             "📅 開始時間投票コマンド\n"
-            f"作成: `{prefix}schedule add @VALORANT [候補...]`\n"
+            f"作成: `{prefix}schedule add @ロール [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
@@ -1375,14 +1356,6 @@ class PollCog(commands.Cog):
     ) -> None:
         if message_id not in self._registered_schedule_ids:
             return
-        cached_channel = self.bot.get_channel(channel_id)
-        if cached_channel is not None and not is_schedule_channel_target(
-            self.bot,
-            cached_channel,
-        ):
-            self._unregister_schedule_poll(message_id)
-            return
-
         if cancelled_user_id is not _CANCELLED_USER_UNCHANGED:
             if cancelled_user_id is None:
                 self._last_cancelled_user_ids.pop(message_id, None)
@@ -1529,10 +1502,6 @@ class PollCog(commands.Cog):
         if not hasattr(channel, "fetch_message") or not hasattr(channel, "send"):
             self._unregister_schedule_poll(message_id)
             return
-        if not is_schedule_channel_target(self.bot, channel):
-            self._unregister_schedule_poll(message_id)
-            return
-
         try:
             poll_message = await channel.fetch_message(message_id)
         except discord.NotFound:
@@ -2076,7 +2045,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule add @VALORANT [候補...]`\n"
+                "❌ 使い方: `/schedule add @ロール [候補...]`\n"
                 f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`",
             )
             return
@@ -2117,14 +2086,6 @@ class PollCog(commands.Cog):
     async def _validate_schedule_context(self, ctx: commands.Context) -> bool:
         if ctx.guild is None:
             await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
-            return False
-        if not is_schedule_channel(ctx):
-            configured_id = getattr(ctx.bot, "valorant_channel_id", 0)
-            channel_label = f"<#{configured_id}>" if configured_id else "#valorant"
-            await self._send_notice(
-                ctx,
-                f"❌ このコマンドは {channel_label} でのみ使えます",
-            )
             return False
         return True
 

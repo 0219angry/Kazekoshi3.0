@@ -22,7 +22,6 @@ from kazekoshi.cogs.poll import (
     choose_start_time,
     format_schedule_options,
     is_auto_start_schedule,
-    is_schedule_channel,
     normalize_schedule_time,
     parse_message_id,
     parse_schedule_options,
@@ -101,7 +100,7 @@ class ScheduleHarness:
         }
         self.role = SimpleNamespace(
             id=88,
-            name="VALORANT",
+            name="GAME",
             mention="<@&88>",
         )
         self.creator = SimpleNamespace(id=77, display_name="creator")
@@ -136,14 +135,13 @@ class ScheduleHarness:
         self._next_notification_id = 1000
         self.channel = SimpleNamespace(
             id=self.CHANNEL_ID,
-            name="valorant",
+            name="planning",
             parent=None,
             fetch_message=AsyncMock(side_effect=self._fetch_message),
             send=AsyncMock(side_effect=self._send_message),
         )
         self.bot = SimpleNamespace(
             user=self.bot_user,
-            valorant_channel_id=0,
             get_channel=lambda channel_id: (
                 self.channel if channel_id == self.CHANNEL_ID else None
             ),
@@ -390,46 +388,6 @@ class ScheduleDisplayTests(unittest.TestCase):
 
         self.assertEqual(schedule_author_id(embed), 987)
 
-    def test_channel_name_id_and_parent_thread_are_supported(self):
-        named_ctx = SimpleNamespace(
-            channel=SimpleNamespace(id=1, name="VaLoRaNt", parent=None),
-            bot=SimpleNamespace(valorant_channel_id=0),
-        )
-        configured_ctx = SimpleNamespace(
-            channel=SimpleNamespace(id=222, name="other", parent=None),
-            bot=SimpleNamespace(valorant_channel_id=222),
-        )
-        thread = Mock(spec=discord.Thread)
-        thread.id = 333
-        thread.name = "schedule-thread"
-        thread.parent = SimpleNamespace(id=222, name="valorant")
-        thread_ctx = SimpleNamespace(
-            channel=thread,
-            bot=SimpleNamespace(valorant_channel_id=222),
-        )
-        category_child_ctx = SimpleNamespace(
-            channel=SimpleNamespace(
-                id=444,
-                name="general",
-                parent=SimpleNamespace(id=555, name="valorant"),
-            ),
-            bot=SimpleNamespace(valorant_channel_id=0),
-        )
-        wrong_parent_thread = Mock(spec=discord.Thread)
-        wrong_parent_thread.id = 666
-        wrong_parent_thread.name = "valorant"
-        wrong_parent_thread.parent = SimpleNamespace(id=777, name="general")
-        wrong_parent_thread_ctx = SimpleNamespace(
-            channel=wrong_parent_thread,
-            bot=SimpleNamespace(valorant_channel_id=0),
-        )
-
-        self.assertTrue(is_schedule_channel(named_ctx))
-        self.assertTrue(is_schedule_channel(configured_ctx))
-        self.assertTrue(is_schedule_channel(thread_ctx))
-        self.assertFalse(is_schedule_channel(category_child_ctx))
-        self.assertFalse(is_schedule_channel(wrong_parent_thread_ctx))
-
     def test_hybrid_group_exposes_add_and_update_slash_subcommands(self):
         self.assertIsInstance(PollCog.schedule, commands.HybridGroup)
         application_commands = PollCog.schedule.app_command.commands
@@ -498,7 +456,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             await bot.close()
 
     async def test_add_posts_embed_and_number_reactions(self):
-        bot = SimpleNamespace(valorant_channel_id=0)
+        bot = SimpleNamespace()
         cog = PollCog(bot, registry=self.registry)
         permissions = SimpleNamespace(
             mention_everyone=True,
@@ -511,14 +469,14 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         channel = SimpleNamespace(
             id=10,
-            name="valorant",
+            name="general",
             parent=None,
             permissions_for=lambda _: permissions,
         )
         author = SimpleNamespace(id=77, display_name="tester")
         role = SimpleNamespace(
             id=88,
-            name="VALORANT",
+            name="RAID",
             mention="<@&88>",
             mentionable=True,
             is_default=lambda: False,
@@ -542,6 +500,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         sent = ctx.send.await_args.kwargs
         self.assertEqual(sent["content"], "<@&88>")
         self.assertEqual(sent["allowed_mentions"].roles, [role])
+        self.assertEqual(sent["embed"].title, "📅 RAID 開始時間")
         self.assertTrue(is_auto_start_schedule(sent["embed"]))
         self.assertEqual(
             sent["embed"].description,
@@ -596,7 +555,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             channel_id=10,
             message_id=expired_id,
         )
-        bot = SimpleNamespace(valorant_channel_id=0)
+        bot = SimpleNamespace()
         cog = PollCog(bot, registry=self.registry)
         prune_expired = cog._prune_expired_schedule_polls
         cog._prune_expired_schedule_polls = Mock(
@@ -654,7 +613,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             read_message_history=True,
             add_reactions=False,
         )
-        bot = SimpleNamespace(valorant_channel_id=0)
+        bot = SimpleNamespace()
         cog = PollCog(bot, registry=self.registry)
         role = SimpleNamespace(
             id=88,
@@ -685,7 +644,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_edits_embed_and_resets_reactions(self):
         bot_user = SimpleNamespace(id=1)
-        bot = SimpleNamespace(valorant_channel_id=0, user=bot_user)
+        bot = SimpleNamespace(user=bot_user)
         cog = PollCog(bot, registry=self.registry)
         cog._queue_auto_start_check_by_id = Mock()
         permissions = SimpleNamespace(
@@ -774,7 +733,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("投票をリセット", ctx.send.await_args.args[0])
 
     async def test_prefix_add_requires_an_actual_role_mention(self):
-        bot = SimpleNamespace(valorant_channel_id=0)
+        bot = SimpleNamespace()
         cog = PollCog(bot, registry=self.registry)
         role = SimpleNamespace(
             id=88,
@@ -799,7 +758,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_rejects_non_creator_without_manage_messages(self):
         bot_user = SimpleNamespace(id=1)
-        bot = SimpleNamespace(valorant_channel_id=0, user=bot_user)
+        bot = SimpleNamespace(user=bot_user)
         cog = PollCog(bot, registry=self.registry)
         creator = SimpleNamespace(id=77, display_name="creator")
         requester = SimpleNamespace(id=66, display_name="requester")

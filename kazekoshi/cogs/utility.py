@@ -88,7 +88,7 @@ HELP_SECTIONS = {
         "cmds": [
             ("{p}poll [質問] [選択肢]", "投票を作成（最大10択）"),
             ("{p}quickpoll [質問]",     "👍 / 👎 の簡易投票"),
-            ("{p}schedule add @ロール [候補...]", "#valorant に開始時間投票を作成"),
+            ("{p}schedule add @ロール [候補...]", "任意のチャンネルに開始時間投票を作成"),
             ("{p}schedule update [投稿ID] [候補...]", "開始時間投票を更新・票をリセット"),
             ("{p}schedule close [投稿ID]", "開始時間投票の自動判定を終了"),
             ("{p}userinfo [メンバー]",  "ユーザー情報を表示"),
