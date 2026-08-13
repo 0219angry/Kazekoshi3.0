@@ -91,6 +91,7 @@ HELP_SECTIONS = {
             ("{p}schedule add @ロール [候補...] [人数]", "開始時間投票を作成（最低人数は5人）"),
             ("{p}schedule status [投稿ID]", "現在の票数と成立状況を表示"),
             ("{p}schedule clone [投稿ID]", "同じ設定で新しい投票を作成"),
+            ("{p}schedule date [投稿ID] [日付]", "投稿日と異なる開催日を設定"),
             ("{p}schedule minimum [投稿ID] [人数]", "既存票を残して最低人数を変更"),
             ("{p}schedule deadline [投稿ID] [日時]", "日本時間の締切を設定・解除"),
             ("{p}schedule update [投稿ID] [候補...]", "開始時間投票を更新・票をリセット"),

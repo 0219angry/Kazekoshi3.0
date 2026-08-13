@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging import getLogger
 from pathlib import Path
 from typing import Optional
@@ -69,6 +69,8 @@ SCHEDULE_DEADLINE_MAX_DAYS = 90
 SCHEDULE_DEADLINE_FIELD_NAME = "締切"
 SCHEDULE_DEADLINE_VALUE_PATTERN = re.compile(r"<t:(?P<timestamp>\d+):F>")
 SCHEDULE_DECISION_FIELD_NAME = "確定開始"
+SCHEDULE_DATE_FIELD_NAME = "開催日"
+SCHEDULE_DATE_MAX_DAYS = 90
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -490,6 +492,42 @@ def parse_schedule_deadline(
     return deadline_at
 
 
+def parse_schedule_date(
+    value: str,
+    *,
+    now: datetime | None = None,
+) -> date | None:
+    """開催日の入力を解析する。投稿日の指定へ戻す場合はNoneを返す。"""
+    raw_value = value.strip()
+    if raw_value.casefold() in {"clear", "default", "投稿日", "解除"}:
+        return None
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_date = current_time.astimezone(SCHEDULE_TIMEZONE).date()
+    if raw_value.casefold() in {"today", "今日"}:
+        event_date = current_date
+    else:
+        event_date = None
+        for date_format in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                event_date = datetime.strptime(raw_value, date_format).date()
+                break
+            except ValueError:
+                continue
+        if event_date is None:
+            raise ScheduleInputError(
+                "開催日は `YYYY-MM-DD` 形式、`today`、または `clear` で指定してください"
+            )
+
+    if abs((event_date - current_date).days) > SCHEDULE_DATE_MAX_DAYS:
+        raise ScheduleInputError(
+            f"開催日は今日から前後{SCHEDULE_DATE_MAX_DAYS}日以内で指定してください"
+        )
+    return event_date
+
+
 def format_schedule_deadline(deadline_at: datetime) -> str:
     timestamp = int(deadline_at.timestamp())
     return f"<t:{timestamp}:F>（<t:{timestamp}:R>）"
@@ -614,6 +652,66 @@ def set_schedule_decision(
             value=value,
             inline=False,
         )
+
+
+def schedule_date_override(embed: discord.Embed) -> date | None:
+    for field in embed.fields:
+        if field.name != SCHEDULE_DATE_FIELD_NAME:
+            continue
+        try:
+            return datetime.strptime(field.value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def set_schedule_date_override(
+    embed: discord.Embed,
+    event_date: date | None,
+) -> None:
+    field_index = next(
+        (
+            index
+            for index, field in enumerate(embed.fields)
+            if field.name == SCHEDULE_DATE_FIELD_NAME
+        ),
+        None,
+    )
+    if event_date is None:
+        if field_index is not None:
+            embed.remove_field(field_index)
+        return
+    value = event_date.isoformat()
+    if field_index is None:
+        embed.add_field(
+            name=SCHEDULE_DATE_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
+    else:
+        embed.set_field_at(
+            field_index,
+            name=SCHEDULE_DATE_FIELD_NAME,
+            value=value,
+            inline=False,
+        )
+
+
+def schedule_default_date(poll_message: discord.Message) -> date:
+    created_at = getattr(poll_message, "created_at", None)
+    if created_at is None:
+        created_at = discord.utils.snowflake_time(poll_message.id)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at.astimezone(SCHEDULE_TIMEZONE).date()
+
+
+def schedule_event_date(poll_message: discord.Message) -> date:
+    if poll_message.embeds:
+        override = schedule_date_override(poll_message.embeds[0])
+        if override is not None:
+            return override
+    return schedule_default_date(poll_message)
 
 
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
@@ -857,6 +955,8 @@ def build_schedule_embed(
 def build_schedule_status_embed(
     source_embed: discord.Embed,
     voters_by_option: dict[str, set[int]],
+    *,
+    event_date: date | None = None,
 ) -> discord.Embed:
     """現在の票数と、自動判定に使う重複除外の累計人数を表示する。"""
     options = schedule_options_from_embed(source_embed) or list(voters_by_option)
@@ -894,6 +994,8 @@ def build_schedule_status_embed(
         color = discord.Color.blue()
 
     summary = [f"状態: {state}"]
+    if event_date is not None:
+        summary.append(f"開催日: {event_date.isoformat()}")
     if decided_start_time is not None:
         summary.append(f"確定開始: {format_start_label(decided_start_time)}")
     if minimum is not None:
@@ -1072,6 +1174,7 @@ class PollCog(commands.Cog):
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"状況確認: `{prefix}schedule status <投稿IDまたはリンク>`\n"
             f"複製: `{prefix}schedule clone <投稿IDまたはリンク>`\n"
+            f"開催日: `{prefix}schedule date <投稿IDまたはリンク> 2026-08-14`\n"
             f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
             f"締切設定: `{prefix}schedule deadline <投稿IDまたはリンク> 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
@@ -1314,6 +1417,7 @@ class PollCog(commands.Cog):
         status_embed = build_schedule_status_embed(
             poll_message.embeds[0],
             voters_by_option,
+            event_date=schedule_event_date(poll_message),
         )
         status_embed.url = poll_message.jump_url
         await self._send_embed_notice(ctx, status_embed)
@@ -1378,6 +1482,103 @@ class PollCog(commands.Cog):
                 message_id,
                 cloned_message.id,
             )
+
+    @schedule.command(name="date", description="開始時間投票の開催日を設定します")
+    @app_commands.describe(
+        message="開催日を設定する開始時間投票の投稿IDまたはリンク",
+        date="開催日（YYYY-MM-DD）。投稿日に戻す場合は clear",
+    )
+    @commands.guild_only()
+    async def schedule_date(
+        self,
+        ctx: commands.Context,
+        message: str,
+        date: str,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        try:
+            event_date = parse_schedule_date(date, now=self._utc_now())
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        missing_permissions = [
+            name
+            for name, enabled in {
+                "メッセージ履歴を読む": bot_permissions.read_message_history,
+                "埋め込みリンク": bot_permissions.embed_links,
+            }.items()
+            if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            await self._change_schedule_date(ctx, message_id, event_date)
+
+    async def _change_schedule_date(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+        event_date: date | None,
+    ) -> None:
+        poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+        original_embed = poll_message.embeds[0]
+        default_date = schedule_default_date(poll_message)
+        stored_date = None if event_date == default_date else event_date
+        current_stored_date = schedule_date_override(original_embed)
+        if current_stored_date == stored_date:
+            effective_date = stored_date or default_date
+            await self._send_notice(
+                ctx,
+                f"ℹ️ 開催日はすでに{effective_date.isoformat()}です\n"
+                f"{poll_message.jump_url}",
+            )
+            return
+
+        updated_embed = original_embed.copy()
+        set_schedule_date_override(updated_embed, stored_date)
+        try:
+            await poll_message.edit(embed=updated_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("failed to change schedule poll %s date", message_id)
+            await self._send_notice(ctx, "❌ 開催日を変更できませんでした")
+            return
+
+        effective_date = stored_date or default_date
+        action = (
+            f"開催日を{effective_date.isoformat()}に設定しました"
+            if stored_date is not None
+            else f"開催日を投稿日（{effective_date.isoformat()}）に戻しました"
+        )
+        await self._send_notice(
+            ctx,
+            f"✅ {action}\n{poll_message.jump_url}",
+        )
+        logger.info(
+            "%s changed schedule poll %s date to %s",
+            ctx.author,
+            message_id,
+            stored_date,
+        )
 
     @schedule.command(
         name="minimum",
@@ -3420,6 +3621,20 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule clone <投稿IDまたはリンク>`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_date.error
+    async def schedule_date_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule date <投稿IDまたはリンク> YYYY-MM-DD`\n"
+                "投稿日に戻す場合: `/schedule date <投稿IDまたはリンク> clear`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):

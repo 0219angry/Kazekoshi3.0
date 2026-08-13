@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -32,16 +32,20 @@ from kazekoshi.cogs.poll import (
     mark_start_time_announced,
     normalize_schedule_time,
     parse_schedule_add_options,
+    parse_schedule_date,
     parse_schedule_deadline,
     parse_message_id,
     parse_schedule_options,
     schedule_author_id,
+    schedule_date_override,
     schedule_decided_start_time,
     schedule_deadline_at,
+    schedule_event_date,
     schedule_option_emojis,
     schedule_options_from_embed,
     set_auto_start_minimum,
     set_schedule_decision,
+    set_schedule_date_override,
     set_schedule_deadline,
     start_announcement,
 )
@@ -364,6 +368,25 @@ class ScheduleParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleInputError, "90日以内"):
             parse_schedule_deadline("2026-11-09 09:01", now=FIXED_NOW)
 
+    def test_parse_schedule_date_supports_japan_today_and_clear(self):
+        self.assertEqual(
+            parse_schedule_date("2026-08-14", now=FIXED_NOW),
+            date(2026, 8, 14),
+        )
+        self.assertEqual(
+            parse_schedule_date("2026/08/14", now=FIXED_NOW),
+            date(2026, 8, 14),
+        )
+        self.assertEqual(
+            parse_schedule_date("today", now=FIXED_NOW),
+            date(2026, 8, 10),
+        )
+        self.assertIsNone(parse_schedule_date("clear", now=FIXED_NOW))
+        with self.assertRaisesRegex(ScheduleInputError, "YYYY-MM-DD"):
+            parse_schedule_date("tomorrow", now=FIXED_NOW)
+        with self.assertRaisesRegex(ScheduleInputError, "前後90日以内"):
+            parse_schedule_date("2026-11-09", now=FIXED_NOW)
+
     def test_choose_start_time_counts_distinct_people_from_early_time(self):
         voters = {
             "20:00": set(),
@@ -557,6 +580,23 @@ class ScheduleDisplayTests(unittest.TestCase):
         set_schedule_decision(embed, None)
         self.assertIsNone(schedule_decided_start_time(embed))
 
+    def test_schedule_date_override_replaces_message_date(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(role, ["20:00", "21:00"], author)
+        message = SimpleNamespace(
+            id=schedule_snowflake(FIXED_NOW),
+            created_at=FIXED_NOW,
+            embeds=[embed],
+        )
+
+        self.assertEqual(schedule_event_date(message), date(2026, 8, 10))
+        set_schedule_date_override(embed, date(2026, 8, 14))
+        self.assertEqual(schedule_date_override(embed), date(2026, 8, 14))
+        self.assertEqual(schedule_event_date(message), date(2026, 8, 14))
+        set_schedule_date_override(embed, None)
+        self.assertEqual(schedule_event_date(message), date(2026, 8, 10))
+
     def test_legacy_multiline_options_remain_readable(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
@@ -593,6 +633,7 @@ class ScheduleDisplayTests(unittest.TestCase):
                 "add",
                 "status",
                 "clone",
+                "date",
                 "minimum",
                 "deadline",
                 "update",
@@ -728,6 +769,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                     "add",
                     "status",
                     "clone",
+                    "date",
                     "minimum",
                     "deadline",
                     "update",
@@ -925,6 +967,75 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             channel_id=10,
             message_id=cloned_message.id,
         )
+
+    async def test_date_sets_override_and_clear_restores_message_date(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        role = SimpleNamespace(name="RAID")
+        poll_message = SimpleNamespace(
+            id=99,
+            created_at=FIXED_NOW,
+            author=bot_user,
+            embeds=[
+                build_schedule_embed(
+                    role,
+                    ["20:00", "21:00", "NG"],
+                    creator,
+                    auto_start=True,
+                )
+            ],
+            jump_url="https://discord.com/channels/1/10/99",
+            edit=AsyncMock(),
+        )
+
+        async def save_poll_edit(*, embed):
+            poll_message.embeds = [embed]
+            return poll_message
+
+        poll_message.edit.side_effect = save_poll_edit
+        bot_permissions = SimpleNamespace(
+            read_message_history=True,
+            embed_links=True,
+        )
+        creator_permissions = SimpleNamespace(manage_messages=False)
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else creator_permissions
+
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=permissions_for,
+            fetch_message=AsyncMock(return_value=poll_message),
+        )
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(
+            bot,
+            now_provider=lambda: FIXED_NOW,
+            registry=self.registry,
+        )
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=creator,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_date.callback(cog, ctx, "99", "2026-08-14")
+
+        self.assertEqual(
+            schedule_date_override(poll_message.embeds[0]),
+            date(2026, 8, 14),
+        )
+        self.assertIn("2026-08-14に設定", ctx.send.await_args.args[0])
+
+        ctx.send.reset_mock()
+        await PollCog.schedule_date.callback(cog, ctx, "99", "clear")
+
+        self.assertIsNone(schedule_date_override(poll_message.embeds[0]))
+        self.assertEqual(schedule_event_date(poll_message), date(2026, 8, 10))
+        self.assertIn("投稿日（2026-08-10）", ctx.send.await_args.args[0])
 
     async def test_decide_normalizes_candidate_notifies_role_and_closes_poll(self):
         bot_user = SimpleNamespace(id=1, bot=True)

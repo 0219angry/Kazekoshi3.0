@@ -118,6 +118,7 @@ config.ini            # 設定ファイル（config.ini.example をコピーし�
 | `/schedule add role:@ロール options:21:00 22:00 23:00 NG [3]` | 任意のチャンネルに開始時間投票を作成（候補・最低人数は省略可） |
 | `/schedule status message:<投稿IDまたはリンク>` | 票数・重複除外の累計人数・現在の成立時刻を表示 |
 | `/schedule clone message:<投稿IDまたはリンク>` | 元投票と同じロール・候補・最低人数で新しい投票を作成 |
+| `/schedule date message:<投稿IDまたはリンク> date:2026-08-14` | 投稿日と異なる開催日を設定 |
 | `/schedule minimum message:<投稿IDまたはリンク> minimum:3` | 既存票を残したまま自動開始の最低人数を変更 |
 | `/schedule deadline message:<投稿IDまたはリンク> deadline:2026-08-14 19:00` | 日本時間の締切を設定し、自動で投票を終了 |
 | `/schedule update message:<投稿IDまたはリンク> options:21:00 22:00 24:00 NG` | 候補を更新して投票をリセット |
@@ -142,6 +143,8 @@ config.ini            # 設定ファイル（config.ini.example をコピーし�
 - 複数候補への投票が可能
 - `status` は誰でも実行可能。スラッシュコマンドでは実行者だけに結果を表示
 - `clone` は誰でも実行可能。ロール・候補・最低人数だけを引き継ぎ、票・締切・通知状態・終了状態は引き継がない
+- 開催日は通常、投票を投稿した日の日本時間として扱う。別日に開催する場合は `date` で今日から前後90日以内の `YYYY-MM-DD` を指定し、`clear` で投稿日へ戻せる
+- `date` は作成者またはメッセージ管理権限を持つユーザーだけが実行可能
 - `minimum` は作成者またはメッセージ管理権限を持つユーザーだけが実行可能
 - `deadline` は作成者またはメッセージ管理権限を持つユーザーだけが実行可能。`YYYY-MM-DD HH:MM` または `YYYY/MM/DD HH:MM` の日本時間で90日以内を指定し、`clear`・`解除` で取り消し可能
 - 締切はSQLiteへ保存し、Bot再起動後も復元。締切時刻になると開始通知を取り消して投票を終了
