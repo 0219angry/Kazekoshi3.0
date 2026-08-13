@@ -24,7 +24,9 @@ OPTION_EMOJIS = EMOJI_NUMBERS + EMOJI_LETTERS[
 ]
 EMOJI_NG = "🆖"
 SCHEDULE_TITLE_PREFIX = "📅 "
-SCHEDULE_TITLE_MINIMUM_PATTERN = re.compile(r"\s+\[[1-9]\d{0,2}人\]$")
+SCHEDULE_TITLE_MINIMUM_PATTERN = re.compile(
+    r"\s+\[(?P<minimum>[1-9]\d{0,2})人\]$"
+)
 SCHEDULE_FOOTER_PATTERN = re.compile(r"\|\s*作成者ID:\s*(\d+)\s*$")
 MESSAGE_LINK_PATTERN = re.compile(
     r"https?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/"
@@ -387,6 +389,22 @@ def auto_start_minimum(embed: discord.Embed) -> int | None:
     return int(match.group("minimum")) if match is not None else None
 
 
+def schedule_minimum(embed: discord.Embed) -> int | None:
+    """自動判定中・終了済みにかかわらず、表示中の最低人数を返す。"""
+    minimum = auto_start_minimum(embed)
+    if minimum is not None:
+        return minimum
+    title = embed.title or ""
+    if title.endswith("（終了）"):
+        title = title[:-len("（終了）")]
+    match = SCHEDULE_TITLE_MINIMUM_PATTERN.search(title)
+    return int(match.group("minimum")) if match is not None else None
+
+
+def is_schedule_closed(embed: discord.Embed) -> bool:
+    return SCHEDULE_CLOSED_MARKER in (embed.footer.text or "")
+
+
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
     options = schedule_options_from_embed(embed)
     return (
@@ -625,6 +643,74 @@ def build_schedule_embed(
     return embed
 
 
+def build_schedule_status_embed(
+    source_embed: discord.Embed,
+    voters_by_option: dict[str, set[int]],
+) -> discord.Embed:
+    """現在の票数と、自動判定に使う重複除外の累計人数を表示する。"""
+    options = schedule_options_from_embed(source_embed) or list(voters_by_option)
+    emojis = schedule_option_emojis(options)
+    time_entries: list[tuple[int, int, str]] = []
+    if normalize_auto_start_options(options) is not None:
+        for index, option in enumerate(options):
+            normalized = normalize_schedule_time(option)
+            if normalized is None:
+                continue
+            hour, minute = (int(part) for part in normalized.split(":"))
+            time_entries.append((hour * 60 + minute, index, option))
+
+    cumulative_counts: dict[int, int] = {}
+    distinct_voters: set[int] = set()
+    for _, index, option in sorted(time_entries):
+        distinct_voters.update(voters_by_option.get(option, set()))
+        cumulative_counts[index] = len(distinct_voters)
+
+    minimum = schedule_minimum(source_embed)
+    auto_start_enabled = is_auto_start_schedule(source_embed)
+    if is_schedule_closed(source_embed):
+        state = "⚫ 終了済み"
+        color = discord.Color.dark_grey()
+    elif auto_start_enabled:
+        state = "🟢 自動判定中"
+        color = discord.Color.green()
+    else:
+        state = "🔵 自動判定なし"
+        color = discord.Color.blue()
+
+    summary = [f"状態: {state}"]
+    if minimum is not None:
+        summary.append(f"最低人数: {minimum}人")
+    if auto_start_enabled and minimum is not None:
+        start_time = choose_start_time(voters_by_option, minimum)
+        summary.append(
+            "現在の成立時刻: "
+            + (format_start_label(start_time) if start_time is not None else "未成立")
+        )
+    announcement = start_announcement(source_embed)
+    if announcement is not None:
+        summary.append(f"通知済み: {format_start_label(announcement.start_time)}")
+
+    option_lines: list[str] = []
+    for index, (option, emoji) in enumerate(zip(options, emojis)):
+        escaped_option = discord.utils.escape_markdown(option)[:150]
+        votes = len(voters_by_option.get(option, set()))
+        if index in cumulative_counts:
+            option_lines.append(
+                f"{emoji}{escaped_option}: {votes}票（累計{cumulative_counts[index]}人）"
+            )
+        else:
+            option_lines.append(f"{emoji}{escaped_option}: {votes}票")
+
+    source_title = source_embed.title or "開始時間投票"
+    if source_title.startswith(SCHEDULE_TITLE_PREFIX):
+        source_title = source_title[len(SCHEDULE_TITLE_PREFIX):]
+    return discord.Embed(
+        title=f"📊 {source_title}",
+        description="\n".join([*summary, "", "候補別:", *option_lines]),
+        color=color,
+    )
+
+
 class PollCog(commands.Cog):
     def __init__(
         self,
@@ -743,6 +829,7 @@ class PollCog(commands.Cog):
             "📅 開始時間投票コマンド\n"
             f"作成: `{prefix}schedule add @ロール [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
+            f"状況確認: `{prefix}schedule status <投稿IDまたはリンク>`\n"
             f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
@@ -902,6 +989,72 @@ class PollCog(commands.Cog):
             role.id,
             minimum,
         )
+
+    @schedule.command(name="status", description="開始時間投票の現在状況を表示します")
+    @app_commands.describe(
+        message="確認する開始時間投票の投稿IDまたはリンク",
+    )
+    @commands.guild_only()
+    async def schedule_status(
+        self,
+        ctx: commands.Context,
+        message: str,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        try:
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        missing_permissions = [
+            name
+            for name, enabled in {
+                "メッセージ履歴を読む": bot_permissions.read_message_history,
+                "埋め込みリンク": bot_permissions.embed_links,
+            }.items()
+            if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        poll_message = await self._fetch_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+        options = schedule_options_from_embed(poll_message.embeds[0])
+        if options is None:
+            await self._send_notice(ctx, "❌ 投票の候補を読み取れませんでした")
+            return
+        try:
+            voters_by_option = await self._collect_all_schedule_voters(
+                poll_message,
+                options,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("failed to collect schedule poll status %s", message_id)
+            await self._send_notice(ctx, "❌ 投票状況を取得できませんでした")
+            return
+
+        status_embed = build_schedule_status_embed(
+            poll_message.embeds[0],
+            voters_by_option,
+        )
+        status_embed.url = poll_message.jump_url
+        await self._send_embed_notice(ctx, status_embed)
 
     @schedule.command(
         name="minimum",
@@ -1281,7 +1434,7 @@ class PollCog(commands.Cog):
             )
             logger.info("%s closed schedule poll %s", ctx.author, message_id)
 
-    async def _fetch_editable_schedule_poll(
+    async def _fetch_schedule_poll(
         self,
         ctx: commands.Context,
         message_id: int,
@@ -1306,6 +1459,18 @@ class PollCog(commands.Cog):
         if creator_id is None:
             await self._send_notice(ctx, "❌ 指定された投稿は開始時間投票ではありません")
             return None
+
+        return poll_message
+
+    async def _fetch_editable_schedule_poll(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+    ) -> discord.Message | None:
+        poll_message = await self._fetch_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return None
+        creator_id = schedule_author_id(poll_message.embeds[0])
 
         author_can_manage = ctx.channel.permissions_for(ctx.author).manage_messages
         if ctx.author.id != creator_id and not author_can_manage:
@@ -2247,13 +2412,26 @@ class PollCog(commands.Cog):
         poll_message: discord.Message,
         options: list[str],
     ) -> dict[str, set[int]]:
+        all_voters = await self._collect_all_schedule_voters(
+            poll_message,
+            options,
+        )
+        return {
+            option: voters
+            for option, voters in all_voters.items()
+            if normalize_schedule_time(option) is not None
+        }
+
+    @staticmethod
+    async def _collect_all_schedule_voters(
+        poll_message: discord.Message,
+        options: list[str],
+    ) -> dict[str, set[int]]:
         reactions_by_emoji = {
             str(reaction.emoji): reaction for reaction in poll_message.reactions
         }
         voters_by_option: dict[str, set[int]] = {}
         for option, emoji in zip(options, schedule_option_emojis(options)):
-            if normalize_schedule_time(option) is None:
-                continue
             reaction = reactions_by_emoji.get(emoji)
             voters: set[int] = set()
             if reaction is not None:
@@ -2297,6 +2475,19 @@ class PollCog(commands.Cog):
             return
         if isinstance(error, commands.BadArgument):
             await self._send_notice(ctx, "❌ 対象ロールをメンションで指定してください")
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_status.error
+    async def schedule_status_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule status <投稿IDまたはリンク>`",
+            )
             return
         if isinstance(error, commands.NoPrivateMessage):
             await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
@@ -2378,6 +2569,11 @@ class PollCog(commands.Cog):
     async def _send_notice(ctx: commands.Context, content: str):
         kwargs = {"ephemeral": True} if ctx.interaction is not None else {}
         await ctx.send(content, **kwargs)
+
+    @staticmethod
+    async def _send_embed_notice(ctx: commands.Context, embed: discord.Embed):
+        kwargs = {"ephemeral": True} if ctx.interaction is not None else {}
+        await ctx.send(embed=embed, **kwargs)
 
 
 async def setup(bot):

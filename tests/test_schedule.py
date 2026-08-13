@@ -21,6 +21,7 @@ from kazekoshi.cogs.poll import (
     announced_start_time,
     auto_start_minimum,
     build_schedule_embed,
+    build_schedule_status_embed,
     choose_start_time,
     format_schedule_options,
     is_auto_start_schedule,
@@ -453,6 +454,35 @@ class ScheduleDisplayTests(unittest.TestCase):
         self.assertTrue(is_auto_start_schedule(embed))
         self.assertEqual(auto_start_minimum(embed), 5)
 
+    def test_status_shows_votes_distinct_totals_and_current_result(self):
+        role = SimpleNamespace(name="VALORANT")
+        author = SimpleNamespace(display_name="tester", id=987)
+        embed = build_schedule_embed(
+            role,
+            ["20:00", "20:30", "21:00", "NG"],
+            author,
+            auto_start=True,
+            minimum=5,
+        )
+
+        status = build_schedule_status_embed(
+            embed,
+            {
+                "20:00": {2, 3},
+                "20:30": {3, 4},
+                "21:00": {5, 6},
+                "NG": {7, 8},
+            },
+        )
+
+        self.assertIn("状態: 🟢 自動判定中", status.description)
+        self.assertIn("最低人数: 5人", status.description)
+        self.assertIn("現在の成立時刻: 21:00 開始", status.description)
+        self.assertIn("1️⃣20:00: 2票（累計2人）", status.description)
+        self.assertIn("2️⃣20:30: 2票（累計3人）", status.description)
+        self.assertIn("3️⃣21:00: 2票（累計5人）", status.description)
+        self.assertIn("🆖NG: 2票", status.description)
+
     def test_legacy_multiline_options_remain_readable(self):
         role = SimpleNamespace(name="VALORANT")
         author = SimpleNamespace(display_name="tester", id=987)
@@ -485,7 +515,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         application_commands = PollCog.schedule.app_command.commands
         self.assertEqual(
             [command.name for command in application_commands],
-            ["add", "minimum", "update", "close"],
+            ["add", "status", "minimum", "update", "close"],
         )
         add_command = application_commands[0]
         options_parameter = next(
@@ -542,7 +572,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(schedule_group)
             self.assertEqual(
                 [command.name for command in schedule_group.commands],
-                ["add", "minimum", "update", "close"],
+                ["add", "status", "minimum", "update", "close"],
             )
         finally:
             await bot.close()
@@ -757,6 +787,60 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("1〜999人", ctx.send.await_args.args[0])
 
         ctx.defer.assert_not_awaited()
+
+    async def test_status_is_ephemeral_and_does_not_require_edit_permission(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(bot, registry=self.registry)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        requester = SimpleNamespace(id=66, display_name="requester")
+        role = SimpleNamespace(name="RAID")
+        voter = SimpleNamespace(id=2, bot=False)
+        poll_message = SimpleNamespace(
+            id=99,
+            author=bot_user,
+            embeds=[
+                build_schedule_embed(
+                    role,
+                    ["20:00", "21:00", "NG"],
+                    creator,
+                    auto_start=True,
+                )
+            ],
+            reactions=[FakeReaction("1️⃣", [bot_user, voter], me=True)],
+            jump_url="https://discord.com/channels/1/10/99",
+            edit=AsyncMock(),
+        )
+        bot_permissions = SimpleNamespace(
+            read_message_history=True,
+            embed_links=True,
+        )
+        requester_permissions = SimpleNamespace(manage_messages=False)
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else requester_permissions
+
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=permissions_for,
+            fetch_message=AsyncMock(return_value=poll_message),
+        )
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=requester,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_status.callback(cog, ctx, "99")
+
+        ctx.defer.assert_awaited_once_with(ephemeral=True)
+        sent = ctx.send.await_args
+        self.assertTrue(sent.kwargs["ephemeral"])
+        self.assertIn("1️⃣20:00: 1票", sent.kwargs["embed"].description)
+        poll_message.edit.assert_not_awaited()
 
     async def test_update_edits_embed_and_resets_reactions(self):
         bot_user = SimpleNamespace(id=1)
