@@ -370,14 +370,25 @@ class ScheduleParsingTests(unittest.TestCase):
             parse_schedule_deadline("2026-11-09 09:01", now=FIXED_NOW)
 
     def test_parse_schedule_date_supports_japan_today_and_clear(self):
-        self.assertEqual(
-            parse_schedule_date("2026-08-14", now=FIXED_NOW),
-            date(2026, 8, 14),
-        )
-        self.assertEqual(
-            parse_schedule_date("2026/08/14", now=FIXED_NOW),
-            date(2026, 8, 14),
-        )
+        posted_date = date(2026, 8, 10)
+        for value in (
+            "2026-08-14",
+            "2026/08/14",
+            "20260814",
+            "08-14",
+            "8-14",
+            "0814",
+            "14",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    parse_schedule_date(
+                        value,
+                        now=FIXED_NOW,
+                        posted_date=posted_date,
+                    ),
+                    date(2026, 8, 14),
+                )
         self.assertEqual(
             parse_schedule_date("today", now=FIXED_NOW),
             date(2026, 8, 10),
@@ -387,6 +398,35 @@ class ScheduleParsingTests(unittest.TestCase):
             parse_schedule_date("tomorrow", now=FIXED_NOW)
         with self.assertRaisesRegex(ScheduleInputError, "前後90日以内"):
             parse_schedule_date("2026-11-09", now=FIXED_NOW)
+
+    def test_partial_schedule_date_uses_post_year_and_month(self):
+        now = datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc)
+        posted_date = date(2026, 12, 31)
+
+        for value in ("12-30", "1230", "30"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    parse_schedule_date(
+                        value,
+                        now=now,
+                        posted_date=posted_date,
+                    ),
+                    date(2026, 12, 30),
+                )
+
+    def test_compact_schedule_date_rejects_invalid_calendar_dates(self):
+        with self.assertRaisesRegex(ScheduleInputError, "YYYYMMDD"):
+            parse_schedule_date(
+                "0230",
+                now=FIXED_NOW,
+                posted_date=date(2026, 8, 10),
+            )
+        with self.assertRaisesRegex(ScheduleInputError, "YYYYMMDD"):
+            parse_schedule_date(
+                "31",
+                now=datetime(2026, 4, 1, tzinfo=timezone.utc),
+                posted_date=date(2026, 4, 1),
+            )
 
     def test_choose_start_time_counts_distinct_people_from_early_time(self):
         voters = {
@@ -1053,7 +1093,8 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(user=bot_user)
         cog = PollCog(
             bot,
-            now_provider=lambda: FIXED_NOW,
+            # 投稿日とは別の月に実行し、DD指定が投稿日基準になることも確認する。
+            now_provider=lambda: FIXED_NOW + timedelta(days=25),
             registry=self.registry,
         )
         ctx = SimpleNamespace(
@@ -1079,6 +1120,15 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(schedule_date_override(poll_message.embeds[0]))
         self.assertEqual(schedule_event_date(poll_message), date(2026, 8, 10))
         self.assertIn("投稿日（2026-08-10）", ctx.send.await_args.args[0])
+
+        ctx.send.reset_mock()
+        await PollCog.schedule_date.callback(cog, ctx, "99", "14")
+
+        self.assertEqual(
+            schedule_date_override(poll_message.embeds[0]),
+            date(2026, 8, 14),
+        )
+        self.assertIn("2026-08-14に設定", ctx.send.await_args.args[0])
 
     async def test_decide_normalizes_candidate_notifies_role_and_closes_poll(self):
         bot_user = SimpleNamespace(id=1, bot=True)

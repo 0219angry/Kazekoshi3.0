@@ -50,7 +50,8 @@ source venv/bin/activate && python Kazekoshi.py
 新しい投票を作ります。既存票・締切・開始通知・終了状態は引き継ぎません。
 開催日は通常、投票を投稿した日の日本時間です。別日の募集は
 `/schedule date message:<投稿IDまたはリンク> date:2026-08-14` で今日から前後90日以内の日付を設定し、
-`clear` で投稿日へ戻せます。
+`clear` で投稿日へ戻せます。日付は `YYYY-MM-DD`・`YYYY/MM/DD`・`YYYYMMDD` のほか、`MM-DD`・
+`MMDD` なら投稿日の年、`DD` なら投稿日の年月を補って解釈します。
 `/schedule deadline` では、日本時間の `YYYY-MM-DD HH:MM` 形式で90日以内の締切を設定できます。
 締切は再起動後も復元され、時刻になると開始通知を取り消して投票を自動終了します。`clear` または
 `解除` を指定すると締切を取り消せます。

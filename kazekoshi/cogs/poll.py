@@ -530,8 +530,9 @@ def parse_schedule_date(
     value: str,
     *,
     now: datetime | None = None,
+    posted_date: date | None = None,
 ) -> date | None:
-    """開催日の入力を解析する。投稿日の指定へ戻す場合はNoneを返す。"""
+    """開催日の入力を解析する。部分指定は投稿日を基準に補完する。"""
     raw_value = value.strip()
     if raw_value.casefold() in {"clear", "default", "投稿日", "解除"}:
         return None
@@ -540,6 +541,7 @@ def parse_schedule_date(
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
     current_date = current_time.astimezone(SCHEDULE_TIMEZONE).date()
+    base_date = posted_date or current_date
     if raw_value.casefold() in {"today", "今日"}:
         event_date = current_date
     else:
@@ -550,9 +552,47 @@ def parse_schedule_date(
                 break
             except ValueError:
                 continue
+        if event_date is None and re.fullmatch(r"[0-9]{8}", raw_value):
+            try:
+                event_date = date(
+                    int(raw_value[:4]),
+                    int(raw_value[4:6]),
+                    int(raw_value[6:]),
+                )
+            except ValueError:
+                pass
+        if event_date is None:
+            month_day_match = re.fullmatch(
+                r"(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})",
+                raw_value,
+            )
+            compact_month_day_match = re.fullmatch(
+                r"(?P<month>[0-9]{2})(?P<day>[0-9]{2})",
+                raw_value,
+            )
+            match = month_day_match or compact_month_day_match
+            if match is not None:
+                try:
+                    event_date = date(
+                        base_date.year,
+                        int(match.group("month")),
+                        int(match.group("day")),
+                    )
+                except ValueError:
+                    pass
+        if event_date is None and re.fullmatch(r"[0-9]{1,2}", raw_value):
+            try:
+                event_date = date(
+                    base_date.year,
+                    base_date.month,
+                    int(raw_value),
+                )
+            except ValueError:
+                pass
         if event_date is None:
             raise ScheduleInputError(
-                "開催日は `YYYY-MM-DD` 形式、`today`、または `clear` で指定してください"
+                "開催日は `YYYY-MM-DD`、`YYYYMMDD`、`MM-DD`、`MMDD`、"
+                "`DD`、`today`、または `clear` で指定してください"
             )
 
     if abs((event_date - current_date).days) > SCHEDULE_DATE_MAX_DAYS:
@@ -1469,7 +1509,7 @@ class PollCog(commands.Cog):
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"状況確認: `{prefix}schedule status [投稿IDまたはリンク]`\n"
             f"複製: `{prefix}schedule clone [投稿IDまたはリンク]`\n"
-            f"開催日: `{prefix}schedule date [投稿IDまたはリンク] 2026-08-14`\n"
+            f"開催日: `{prefix}schedule date [投稿IDまたはリンク] <日付>`\n"
             f"最低人数変更: `{prefix}schedule minimum [投稿IDまたはリンク] 3`\n"
             f"締切設定: `{prefix}schedule deadline [投稿IDまたはリンク] 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`\n"
@@ -1774,7 +1814,7 @@ class PollCog(commands.Cog):
     @schedule.command(name="date", description="開始時間投票の開催日を設定します")
     @app_commands.describe(
         message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
-        date="開催日（YYYY-MM-DD）。投稿日に戻す場合は clear",
+        date="開催日（YYYY-MM-DD / YYYYMMDD / MM-DD / MMDD / DD）。解除は clear",
     )
     @commands.guild_only()
     async def schedule_date(
@@ -1791,13 +1831,9 @@ class PollCog(commands.Cog):
         if date is None:
             await self._send_notice(
                 ctx,
-                "❌ 開催日を `YYYY-MM-DD`、`today`、または `clear` で指定してください",
+                "❌ 開催日を `YYYY-MM-DD`、`YYYYMMDD`、`MM-DD`、`MMDD`、"
+                "`DD`、`today`、または `clear` で指定してください",
             )
-            return
-        try:
-            event_date = parse_schedule_date(date, now=self._utc_now())
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
             return
 
         bot_member = ctx.guild.me
@@ -1826,19 +1862,28 @@ class PollCog(commands.Cog):
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
-            await self._change_schedule_date(ctx, message_id, event_date)
+            await self._change_schedule_date(ctx, message_id, date)
 
     async def _change_schedule_date(
         self,
         ctx: commands.Context,
         message_id: int,
-        event_date: date | None,
+        date_value: str,
     ) -> None:
         poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
         if poll_message is None:
             return
         original_embed = poll_message.embeds[0]
         default_date = schedule_default_date(poll_message)
+        try:
+            event_date = parse_schedule_date(
+                date_value,
+                now=self._utc_now(),
+                posted_date=default_date,
+            )
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
         stored_date = None if event_date == default_date else event_date
         current_stored_date = schedule_date_override(original_embed)
         if current_stored_date == stored_date:
@@ -5330,7 +5375,8 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule date [投稿IDまたはリンク] YYYY-MM-DD`\n"
+                "❌ 使い方: `/schedule date [投稿IDまたはリンク] <日付>`\n"
+                "日付: `YYYY-MM-DD` / `YYYYMMDD` / `MM-DD` / `MMDD` / `DD`\n"
                 "投稿日に戻す場合: `/schedule date [投稿IDまたはリンク] clear`",
             )
             return
