@@ -14,6 +14,7 @@ from kazekoshi.cogs.poll import (
     DEFAULT_SCHEDULE_OPTIONS,
     DEFAULT_SCHEDULE_OPTION_LIST,
     EMOJI_NUMBERS,
+    OPTION_EMOJIS,
     PollCog,
     ScheduleInputError,
     SchedulePollRegistry,
@@ -285,8 +286,12 @@ class ScheduleParsingTests(unittest.TestCase):
     def test_parse_rejects_too_few_or_too_many_options(self):
         with self.assertRaisesRegex(ScheduleInputError, "2つ以上"):
             parse_schedule_options("21")
-        with self.assertRaisesRegex(ScheduleInputError, "最大10個"):
-            parse_schedule_options(" ".join(str(index) for index in range(11)))
+        self.assertEqual(
+            len(parse_schedule_options(" ".join(str(index) for index in range(20)))),
+            20,
+        )
+        with self.assertRaisesRegex(ScheduleInputError, "最大20個"):
+            parse_schedule_options(" ".join(str(index) for index in range(21)))
 
     def test_parse_rejects_unclosed_quote_and_long_option(self):
         with self.assertRaisesRegex(ScheduleInputError, "引用符"):
@@ -299,6 +304,20 @@ class ScheduleParsingTests(unittest.TestCase):
             format_schedule_options(["21:00", "22:00", "NG"]),
             "1️⃣21:00, 2️⃣22:00, 🆖NG",
         )
+
+    def test_reactions_continue_with_letters_after_nine(self):
+        options = [f"候補{index}" for index in range(1, 12)]
+
+        self.assertEqual(
+            schedule_option_emojis(options),
+            [*EMOJI_NUMBERS, "🇦", "🇧"],
+        )
+        self.assertEqual(schedule_option_emojis(options), OPTION_EMOJIS[:11])
+
+    def test_twentieth_ng_uses_ng_reaction(self):
+        options = [*[f"候補{index}" for index in range(1, 20)], "NG"]
+
+        self.assertEqual(schedule_option_emojis(options)[-2:], ["🇯", "🆖"])
 
     def test_parse_message_id_or_link(self):
         self.assertEqual(parse_message_id("123456"), (123456, None))

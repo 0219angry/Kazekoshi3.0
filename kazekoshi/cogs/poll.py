@@ -16,7 +16,12 @@ from discord import app_commands
 from discord.ext import commands
 
 logger = getLogger(__name__)
-EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+EMOJI_LETTERS = [chr(0x1F1E6 + index) for index in range(26)]
+MAX_MESSAGE_REACTIONS = 20
+OPTION_EMOJIS = EMOJI_NUMBERS + EMOJI_LETTERS[
+    :MAX_MESSAGE_REACTIONS - len(EMOJI_NUMBERS)
+]
 EMOJI_NG = "🆖"
 SCHEDULE_TITLE_PREFIX = "📅 "
 SCHEDULE_TITLE_MINIMUM_PATTERN = re.compile(r"\s+\[[1-9]\d{0,2}人\]$")
@@ -27,7 +32,7 @@ MESSAGE_LINK_PATTERN = re.compile(
 )
 ROLE_MENTION_PATTERN = re.compile(r"<@&(\d+)>")
 MIN_SCHEDULE_OPTIONS = 2
-MAX_SCHEDULE_OPTIONS = len(EMOJI_NUMBERS)
+MAX_SCHEDULE_OPTIONS = len(OPTION_EMOJIS)
 MAX_SCHEDULE_OPTION_LENGTH = 100
 DEFAULT_SCHEDULE_OPTION_LIST = (
     "20:00",
@@ -42,9 +47,9 @@ DEFAULT_SCHEDULE_OPTION_LIST = (
 )
 DEFAULT_SCHEDULE_OPTIONS = " ".join(DEFAULT_SCHEDULE_OPTION_LIST)
 DEFAULT_TIME_OPTIONS = DEFAULT_SCHEDULE_OPTION_LIST[:-1]
-DEFAULT_TIME_EMOJIS = tuple(EMOJI_NUMBERS[:len(DEFAULT_TIME_OPTIONS)])
+DEFAULT_TIME_EMOJIS = tuple(OPTION_EMOJIS[:len(DEFAULT_TIME_OPTIONS)])
 DEFAULT_SCHEDULE_EMOJIS = DEFAULT_TIME_EMOJIS + (EMOJI_NG,)
-SCHEDULE_REACTION_EMOJIS = tuple(EMOJI_NUMBERS) + (EMOJI_NG,)
+SCHEDULE_REACTION_EMOJIS = tuple(OPTION_EMOJIS) + (EMOJI_NG,)
 SCHEDULE_ENTRY_PATTERN = re.compile(
     rf"(?:^|, )(?P<emoji>{'|'.join(re.escape(emoji) for emoji in SCHEDULE_REACTION_EMOJIS)})"
 )
@@ -190,7 +195,7 @@ def parse_schedule_options(value: str) -> list[str]:
     if len(options) < MIN_SCHEDULE_OPTIONS:
         raise ScheduleInputError("候補を2つ以上入力してください")
     if len(options) > MAX_SCHEDULE_OPTIONS:
-        raise ScheduleInputError("候補は最大10個です")
+        raise ScheduleInputError(f"候補は最大{MAX_SCHEDULE_OPTIONS}個です")
     if any(len(option) > MAX_SCHEDULE_OPTION_LENGTH for option in options):
         raise ScheduleInputError(
             f"候補は1つにつき{MAX_SCHEDULE_OPTION_LENGTH}文字以内にしてください"
@@ -284,7 +289,7 @@ def schedule_option_emojis(options: list[str]) -> list[str]:
         if option.casefold() == "ng" and index == last_index:
             emojis.append(EMOJI_NG)
             continue
-        emojis.append(EMOJI_NUMBERS[index])
+        emojis.append(OPTION_EMOJIS[index])
     return emojis
 
 
@@ -349,7 +354,7 @@ def _valid_schedule_option_emojis(
         is_legacy_ng = (
             index == len(options) - 1
             and options[index].casefold() == "ng"
-            and actual == EMOJI_NUMBERS[index]
+            and actual == OPTION_EMOJIS[index]
         )
         if actual != expected and not is_legacy_ng:
             return False
@@ -681,15 +686,15 @@ class PollCog(commands.Cog):
         if len(option_list) < 2:
             await ctx.send("❌ 選択肢を2つ以上カンマ区切りで入力してください（例: `A,B,C`）")
             return
-        if len(option_list) > 10:
-            await ctx.send("❌ 選択肢は最大10個です")
+        if len(option_list) > len(OPTION_EMOJIS):
+            await ctx.send(f"❌ 選択肢は最大{len(OPTION_EMOJIS)}個です")
             return
-        description = "\n".join(f"{EMOJI_NUMBERS[i]}　{opt}" for i, opt in enumerate(option_list))
+        description = "\n".join(f"{OPTION_EMOJIS[i]}　{opt}" for i, opt in enumerate(option_list))
         embed = discord.Embed(title=f"📊 {question}", description=description, color=discord.Color.blue())
         embed.set_footer(text=f"作成者: {ctx.author.display_name}")
         poll_msg = await ctx.send(embed=embed)
         for i in range(len(option_list)):
-            await poll_msg.add_reaction(EMOJI_NUMBERS[i])
+            await poll_msg.add_reaction(OPTION_EMOJIS[i])
         logger.info(f"{ctx.author} created poll: {question}")
 
     @commands.command(name="quickpoll")
@@ -1419,7 +1424,7 @@ class PollCog(commands.Cog):
             or getattr(payload, "user_id", None) == bot_user.id
             or (
                 check_emoji
-                and str(getattr(payload, "emoji", "")) not in EMOJI_NUMBERS
+                and str(getattr(payload, "emoji", "")) not in OPTION_EMOJIS
             )
         ):
             return
