@@ -883,6 +883,21 @@ class ScheduleLatenessRegistry:
             if month_start.month == 12
             else month_start.replace(month=month_start.month + 1)
         )
+        return self.stats_between(
+            guild_id=guild_id,
+            start_date=month_start,
+            end_date=month_end,
+        )
+
+    def stats_between(
+        self,
+        *,
+        guild_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> list[MonthlyLatenessStat]:
+        if end_date <= start_date:
+            raise ValueError("end_date must be after start_date")
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
@@ -904,7 +919,7 @@ class ScheduleLatenessRegistry:
                 ORDER BY SUM(attendance.late_seconds) DESC,
                          COUNT(*) DESC, attendance.user_id
                 """,
-                (guild_id, month_start.isoformat(), month_end.isoformat()),
+                (guild_id, start_date.isoformat(), end_date.isoformat()),
             ).fetchall()
         return [
             MonthlyLatenessStat(

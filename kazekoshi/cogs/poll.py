@@ -18,6 +18,7 @@ from discord.ext import commands
 
 from kazekoshi.schedule_lateness import (
     LATENESS_TRACKING_HOURS,
+    MonthlyLatenessStat,
     ScheduleLatenessEvent,
     ScheduleLatenessRegistry,
     lateness_voice_quorum,
@@ -80,6 +81,10 @@ SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
 LATEST_SCHEDULE_HISTORY_LIMIT = 100
 LATENESS_REACTION_GRACE_SECONDS = 2
+LATENESS_YEAR_MONTH_PATTERN = re.compile(
+    r"(?P<year>[0-9]{4})[-/]?(?P<month>[0-9]{2})"
+)
+LATENESS_STATS_DESCRIPTION_LIMIT = 3800
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -137,6 +142,13 @@ class RegisteredSchedulePoll:
     channel_id: int
     message_id: int
     deadline_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class LatenessStatsPeriod:
+    start_date: date
+    end_date: date
+    label: str
 
 
 class SchedulePollRegistry:
@@ -542,6 +554,148 @@ def parse_schedule_date(
             f"開催日は今日から前後{SCHEDULE_DATE_MAX_DAYS}日以内で指定してください"
         )
     return event_date
+
+
+def parse_lateness_period(
+    value: str | None,
+    *,
+    now: datetime | None = None,
+) -> LatenessStatsPeriod:
+    """月次または年次集計の対象期間を解析する。"""
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_month = current_time.astimezone(SCHEDULE_TIMEZONE).date().replace(day=1)
+    if value is None or value.strip().casefold() in {"current", "this", "今月"}:
+        year = current_month.year
+        month = current_month.month
+        is_year = False
+    else:
+        raw_value = value.strip()
+        if re.fullmatch(r"[0-9]{1,2}", raw_value):
+            year = current_month.year
+            month = int(raw_value)
+            is_year = False
+        elif re.fullmatch(r"[0-9]{4}", raw_value):
+            year = int(raw_value)
+            month = None
+            is_year = True
+        else:
+            match = LATENESS_YEAR_MONTH_PATTERN.fullmatch(raw_value)
+            if match is None:
+                raise ScheduleInputError(
+                    "対象期間は `10`、`2026`、`202704`、`2027-04` のいずれかの形式で指定してください"
+                )
+            year = int(match.group("year"))
+            month = int(match.group("month"))
+            is_year = False
+
+    try:
+        if is_year:
+            start_date = date(year, 1, 1)
+            end_date = date(year + 1, 1, 1)
+            label = f"{year}年"
+        else:
+            start_date = date(year, month, 1)
+            end_date = (
+                date(year + 1, 1, 1)
+                if month == 12
+                else date(year, month + 1, 1)
+            )
+            label = f"{year:04d}-{month:02d}"
+    except ValueError as error:
+        raise ScheduleInputError(
+            "対象期間は有効な年と1月から12月の範囲で指定してください"
+        ) from error
+    return LatenessStatsPeriod(start_date, end_date, label)
+
+
+def format_lateness_duration(seconds: float) -> str:
+    rounded_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}時間")
+    if minutes:
+        parts.append(f"{minutes}分")
+    if remaining_seconds and not hours:
+        parts.append(f"{remaining_seconds}秒")
+    return "".join(parts) or "0秒"
+
+
+def build_lateness_stats_embeds(
+    stats: list[MonthlyLatenessStat],
+    *,
+    guild,
+    period: LatenessStatsPeriod,
+) -> list[discord.Embed]:
+    """遅刻集計をDiscordのdescription上限内に分割する。"""
+    title = f"⏱️ 遅刻・欠席集計 {period.label}"
+    if not stats:
+        return [
+            discord.Embed(
+                title=title,
+                description="この期間の遅刻・欠席記録はありません。",
+                color=discord.Color.green(),
+            )
+        ]
+
+    lines: list[str] = []
+    for rank, stat in enumerate(stats, start=1):
+        member = guild.get_member(stat.user_id)
+        display_name = (
+            getattr(member, "display_name", None)
+            or getattr(member, "name", None)
+            or f"ユーザーID {stat.user_id}"
+        )
+        safe_name = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(
+                " ".join(str(display_name).splitlines()).strip()
+            )
+        )
+        lines.append(
+            f"**{rank}. {safe_name}** — {stat.count}回｜"
+            f"合計 {format_lateness_duration(stat.total_seconds)}｜"
+            f"平均 {format_lateness_duration(stat.average_seconds)}｜"
+            f"最大 {format_lateness_duration(stat.maximum_seconds)}"
+        )
+
+    chunks: list[list[str]] = []
+    current_chunk: list[str] = []
+    current_length = 0
+    for line in lines:
+        added_length = len(line) + (1 if current_chunk else 0)
+        if (
+            current_chunk
+            and current_length + added_length > LATENESS_STATS_DESCRIPTION_LIMIT
+        ):
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_length = 0
+            added_length = len(line)
+        current_chunk.append(line)
+        current_length += added_length
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    total_records = sum(stat.count for stat in stats)
+    embeds: list[discord.Embed] = []
+    for index, chunk in enumerate(chunks, start=1):
+        page_suffix = f" ({index}/{len(chunks)})" if len(chunks) > 1 else ""
+        embed = discord.Embed(
+            title=title + page_suffix,
+            description="\n".join(chunk),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(
+            text=(
+                f"{len(stats)}人・{total_records}回｜"
+                "lateoff済み募集と遅刻0秒は対象外"
+            )
+        )
+        embeds.append(embed)
+    return embeds
 
 
 def format_schedule_deadline(deadline_at: datetime) -> str:
@@ -1275,6 +1429,7 @@ class PollCog(commands.Cog):
             f"締切設定: `{prefix}schedule deadline [投稿IDまたはリンク] 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`\n"
             f"確定: `{prefix}schedule decide [投稿IDまたはリンク] 21:00`\n"
+            f"遅刻集計: `{prefix}schedule late [期間]`\n"
             f"遅刻判定停止: `{prefix}schedule lateoff [投稿IDまたはリンク]`\n"
             f"終了: `{prefix}schedule close [投稿IDまたはリンク]`"
         )
@@ -2484,6 +2639,89 @@ class PollCog(commands.Cog):
             ctx.author,
             message_id,
             decided_start_time,
+        )
+
+    @schedule.command(
+        name="late",
+        description="月・年ごとの遅刻・欠席集計を表示します",
+    )
+    @app_commands.describe(
+        period="省略で今月。10、2026、202704、2027-04の形式で月または年を指定",
+    )
+    @commands.guild_only()
+    async def schedule_late(
+        self,
+        ctx: commands.Context,
+        period: Optional[str] = None,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        try:
+            target_period = parse_lateness_period(period, now=self._utc_now())
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        try:
+            stats = self._lateness_registry.stats_between(
+                guild_id=ctx.guild.id,
+                start_date=target_period.start_date,
+                end_date=target_period.end_date,
+            )
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to load lateness stats for guild %s period %s",
+                ctx.guild.id,
+                target_period.label,
+            )
+            await self._send_notice(ctx, "❌ 遅刻集計を取得できませんでした")
+            return
+
+        embeds = build_lateness_stats_embeds(
+            stats,
+            guild=ctx.guild,
+            period=target_period,
+        )
+        chart_image = None
+        if stats:
+            try:
+                from kazekoshi.lateness_chart import build_lateness_chart
+
+                chart_image = build_lateness_chart(
+                    stats,
+                    guild=ctx.guild,
+                    period_label=target_period.label,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to render lateness chart for guild %s period %s",
+                    ctx.guild.id,
+                    target_period.label,
+                )
+
+        if chart_image is not None:
+            filename = (
+                f"lateness-{target_period.start_date.isoformat()}-"
+                f"{target_period.end_date.isoformat()}.png"
+            )
+            embeds[0].set_image(url=f"attachment://{filename}")
+            chart_file = discord.File(chart_image, filename=filename)
+            try:
+                kwargs = {"ephemeral": True} if ctx.interaction is not None else {}
+                await ctx.send(embed=embeds[0], file=chart_file, **kwargs)
+            finally:
+                chart_file.close()
+            remaining_embeds = embeds[1:]
+        else:
+            remaining_embeds = embeds
+        for embed in remaining_embeds:
+            await self._send_embed_notice(ctx, embed)
+        logger.info(
+            "%s viewed lateness stats for guild %s period %s",
+            ctx.author,
+            ctx.guild.id,
+            target_period.label,
         )
 
     @schedule.command(
@@ -4721,6 +4959,13 @@ class PollCog(commands.Cog):
                 "❌ 使い方: `/schedule lateoff [投稿IDまたはリンク]`",
             )
             return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_late.error
+    async def schedule_late_error(self, ctx, error):
         if isinstance(error, commands.NoPrivateMessage):
             await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
             return

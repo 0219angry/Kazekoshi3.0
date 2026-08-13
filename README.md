@@ -26,10 +26,10 @@ source venv/bin/activate && python Kazekoshi.py
 
 ### ロール開始時間投票
 
-サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule date`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule decide`、`/schedule lateoff`、`/schedule close` を使用でき、
+サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule date`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule decide`、`/schedule late`、`/schedule lateoff`、`/schedule close` を使用でき、
 対象には `@VALORANT` 以外も含む任意のロールを指定できます。
-`add` 以外は投稿ID・リンクを省略でき、省略時は同じチャンネルの直近100件から最新の
-開始時間投票を対象にします。
+`status`、`clone`、`date`、`minimum`、`deadline`、`update`、`decide`、`lateoff`、`close` は
+投稿ID・リンクを省略でき、省略時は同じチャンネルの直近100件から最新の開始時間投票を対象にします。
 `/schedule add` で対象ロールだけを指定した場合、候補には
 `20:00 20:30 21:00 21:30 22:00 22:30 23:00 24:00 NG` が自動で入ります。
 最低人数はデフォルトで5人です。コマンドの末尾に `[3]` のように1〜999人で指定すると、その投票だけ
@@ -72,7 +72,11 @@ Bot再起動時点ですでにVCにいる人は、誤って遅刻扱いにしな
 遅刻判定が不要な募集や、途中で判定を止めたい募集は
 `/schedule lateoff message:<投稿IDまたはリンク>` で停止できます。作成者またはメッセージ管理権限を
 持つ人だけが実行でき、投稿指定の省略時は同チャンネルの最新募集が対象です。停止後は記録を増やさず、
-すでに記録済みの分も含めてその募集を月次統計と将来の遅刻通知から除外します。
+すでに記録済みの分も含めてその募集を月次・年次統計と将来の遅刻通知から除外します。
+`/schedule late` は日本時間の今月について、ユーザー別の遅刻・欠席回数、合計、平均、最大と、
+合計時間の横棒グラフ（上位20人）を表示します。`10` は今年10月、`2026` は2026年全体、
+`202704`・`2027-04`・`2027/04` は2027年4月を指定します。スラッシュコマンドでは結果を
+実行者だけに表示し、グラフを生成できない環境でも本文の集計は表示します。
 
 通知後もリアクションの追加・削除・全消去を監視します。開始時刻が変わった場合や指定人数未満に
 なった場合は、10秒待ってから以前の通知を取り消し線付きに編集し、変更または取消を新しい

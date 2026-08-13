@@ -5,17 +5,22 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from kazekoshi.cogs.poll import (
+    LatenessStatsPeriod,
     PollCog,
     SchedulePollRegistry,
+    build_lateness_stats_embeds,
     build_schedule_embed,
     eligible_voters_for_start,
+    format_lateness_duration,
     mark_start_time_announced,
+    parse_lateness_period,
     schedule_option_emojis,
     schedule_start_datetime,
     set_schedule_date_override,
 )
 from kazekoshi.schedule_lateness import (
     LATENESS_MAX_SECONDS,
+    MonthlyLatenessStat,
     ScheduleLatenessRegistry,
     lateness_voice_quorum,
 )
@@ -68,6 +73,99 @@ class ScheduleLatenessLogicTests(unittest.TestCase):
             ),
             {2, 3, 4, 5},
         )
+
+    def test_lateness_period_supports_current_month_month_year_and_year_month(self):
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        expected = {
+            None: LatenessStatsPeriod(
+                date(2026, 8, 1),
+                date(2026, 9, 1),
+                "2026-08",
+            ),
+            "10": LatenessStatsPeriod(
+                date(2026, 10, 1),
+                date(2026, 11, 1),
+                "2026-10",
+            ),
+            "2026": LatenessStatsPeriod(
+                date(2026, 1, 1),
+                date(2027, 1, 1),
+                "2026年",
+            ),
+            "202704": LatenessStatsPeriod(
+                date(2027, 4, 1),
+                date(2027, 5, 1),
+                "2027-04",
+            ),
+            "2027-04": LatenessStatsPeriod(
+                date(2027, 4, 1),
+                date(2027, 5, 1),
+                "2027-04",
+            ),
+            "2027/04": LatenessStatsPeriod(
+                date(2027, 4, 1),
+                date(2027, 5, 1),
+                "2027-04",
+            ),
+        }
+        for value, period in expected.items():
+            with self.subTest(value=value):
+                self.assertEqual(
+                    parse_lateness_period(value, now=now),
+                    period,
+                )
+
+    def test_lateness_period_rejects_invalid_month(self):
+        with self.assertRaisesRegex(ValueError, "1月から12月"):
+            parse_lateness_period("13", now=START_AT)
+
+    def test_lateness_duration_and_embed_display(self):
+        self.assertEqual(format_lateness_duration(90), "1分30秒")
+        self.assertEqual(format_lateness_duration(10800), "3時間")
+        guild = SimpleNamespace(
+            get_member=lambda user_id: SimpleNamespace(
+                display_name="player_name"
+            )
+        )
+        embeds = build_lateness_stats_embeds(
+            [
+                MonthlyLatenessStat(
+                    user_id=2,
+                    count=2,
+                    total_seconds=2700,
+                    average_seconds=1350,
+                    maximum_seconds=1800,
+                )
+            ],
+            guild=guild,
+            period=LatenessStatsPeriod(
+                date(2026, 1, 1),
+                date(2027, 1, 1),
+                "2026年",
+            ),
+        )
+        self.assertEqual(embeds[0].title, "⏱️ 遅刻・欠席集計 2026年")
+        self.assertIn("player\\_name", embeds[0].description)
+        self.assertIn("合計 45分", embeds[0].description)
+
+    def test_lateness_chart_is_a_png(self):
+        from kazekoshi.lateness_chart import build_lateness_chart
+
+        guild = SimpleNamespace(
+            get_member=lambda user_id: SimpleNamespace(
+                display_name=f"player-{user_id}"
+            )
+        )
+        image = build_lateness_chart(
+            [
+                MonthlyLatenessStat(2, 2, 2700, 1350, 1800),
+                MonthlyLatenessStat(3, 1, 900, 900, 900),
+            ],
+            guild=guild,
+            period_label="2026年",
+        )
+        self.assertEqual(image.read(8), b"\x89PNG\r\n\x1a\n")
+        image.close()
 
 
 class ScheduleLatenessRegistryTests(unittest.TestCase):
@@ -636,6 +734,46 @@ class ScheduleLatenessVoiceTests(unittest.IsolatedAsyncioTestCase):
             }[5],
             LATENESS_MAX_SECONDS,
         )
+
+    async def test_late_command_supports_yearly_stats_and_attaches_chart(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=3,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.lateness_registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=5),
+            arrivals={2: START_AT + timedelta(minutes=5)},
+        )
+        self.set_now(START_AT + timedelta(minutes=10))
+        ctx = SimpleNamespace(
+            guild=self.guild,
+            author=SimpleNamespace(id=2),
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_late.callback(self.cog, ctx, "2026")
+
+        ctx.defer.assert_awaited_once_with(ephemeral=True)
+        sent = ctx.send.await_args.kwargs
+        self.assertEqual(sent["embed"].title, "⏱️ 遅刻・欠席集計 2026年")
+        self.assertEqual(sent["embed"].image.url[:13], "attachment://")
+        self.assertTrue(sent["file"].filename.endswith(".png"))
+        self.assertTrue(sent["ephemeral"])
 
 
 if __name__ == "__main__":

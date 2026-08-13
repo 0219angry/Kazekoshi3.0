@@ -14,13 +14,21 @@ ok()   { echo -e "${GREEN}✓ ${1}${NC}"; }
 cd "$(dirname "${BASH_SOURCE[0]}")"
 echo -e "${BOLD}=== Kazekoshi v3.0 セットアップ ===${NC}"
 
-# ─── 1. ffmpeg ──────────────────────────────────────────────────────
-step 1 "ffmpeg のインストール"
-if command -v ffmpeg &>/dev/null; then
-    ok "ffmpeg は既にインストール済み"
+# ─── 1. ffmpeg・日本語フォント ──────────────────────────────────────
+step 1 "ffmpeg・日本語フォントのインストール"
+APT_PACKAGES=()
+if ! command -v ffmpeg &>/dev/null; then
+    APT_PACKAGES+=(ffmpeg)
+fi
+if ! command -v fc-list &>/dev/null || ! fc-list :lang=ja | grep . >/dev/null; then
+    APT_PACKAGES+=(fonts-noto-cjk)
+fi
+if [ "${#APT_PACKAGES[@]}" -eq 0 ]; then
+    ok "ffmpeg・日本語フォントは既にインストール済み"
 else
-    sudo apt-get update -qq && sudo apt-get install -y ffmpeg
-    ok "ffmpeg をインストールしました"
+    sudo apt-get update -qq
+    sudo apt-get install -y "${APT_PACKAGES[@]}"
+    ok "不足パッケージをインストールしました: ${APT_PACKAGES[*]}"
 fi
 
 # ─── 2. Python仮想環境 & パッケージ ─────────────────────────────────

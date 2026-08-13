@@ -638,6 +638,7 @@ class ScheduleDisplayTests(unittest.TestCase):
                 "deadline",
                 "update",
                 "decide",
+                "late",
                 "lateoff",
                 "close",
             ],
@@ -647,6 +648,17 @@ class ScheduleDisplayTests(unittest.TestCase):
             parameter for parameter in add_command.parameters if parameter.name == "options"
         )
         self.assertFalse(options_parameter.required)
+        late_command = next(
+            command
+            for command in application_commands
+            if command.name == "late"
+        )
+        period_parameter = next(
+            parameter
+            for parameter in late_command.parameters
+            if parameter.name == "period"
+        )
+        self.assertFalse(period_parameter.required)
         for command_name in (
             "status",
             "clone",
@@ -797,6 +809,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                     "deadline",
                     "update",
                     "decide",
+                    "late",
                     "lateoff",
                     "close",
                 ],
