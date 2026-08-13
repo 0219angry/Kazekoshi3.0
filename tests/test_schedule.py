@@ -18,11 +18,13 @@ from kazekoshi.cogs.poll import (
     ScheduleInputError,
     SchedulePollRegistry,
     announced_start_time,
+    auto_start_minimum,
     build_schedule_embed,
     choose_start_time,
     format_schedule_options,
     is_auto_start_schedule,
     normalize_schedule_time,
+    parse_schedule_add_options,
     parse_message_id,
     parse_schedule_options,
     schedule_author_id,
@@ -254,6 +256,26 @@ class ScheduleParsingTests(unittest.TestCase):
         self.assertIsNone(normalize_schedule_time("24:30"))
         self.assertIsNone(normalize_schedule_time("2360"))
 
+    def test_add_options_support_trailing_minimum(self):
+        self.assertEqual(
+            parse_schedule_add_options("15 16 17 NG [3]"),
+            (["15:00", "16:00", "17:00", "NG"], 3),
+        )
+        self.assertEqual(
+            parse_schedule_add_options("[3]"),
+            (list(DEFAULT_SCHEDULE_OPTION_LIST), 3),
+        )
+        self.assertEqual(
+            parse_schedule_add_options("15 16 17"),
+            (["15:00", "16:00", "17:00"], 5),
+        )
+
+    def test_add_options_reject_invalid_or_non_time_minimum(self):
+        with self.assertRaisesRegex(ScheduleInputError, "1〜999人"):
+            parse_schedule_add_options("15 16 [0]")
+        with self.assertRaisesRegex(ScheduleInputError, "時刻形式"):
+            parse_schedule_add_options("平日 休日 [3]")
+
     def test_parse_quoted_option(self):
         self.assertEqual(
             parse_schedule_options('"8/21 21時" "8/22 22時" ng'),
@@ -316,6 +338,16 @@ class ScheduleParsingTests(unittest.TestCase):
 
         self.assertEqual(choose_start_time(voters), "17:00")
 
+    def test_choose_start_time_uses_custom_minimum(self):
+        voters = {
+            "15:00": {1},
+            "16:00": {2, 3},
+            "17:00": {4},
+        }
+
+        self.assertIsNone(choose_start_time(voters))
+        self.assertEqual(choose_start_time(voters, minimum=3), "16:00")
+
 
 class ScheduleDisplayTests(unittest.TestCase):
     def test_embed_contains_options_and_creator_marker(self):
@@ -353,6 +385,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         )
 
         self.assertTrue(is_auto_start_schedule(time_embed))
+        self.assertEqual(auto_start_minimum(time_embed), 5)
         self.assertEqual(
             time_embed.description,
             "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
@@ -532,10 +565,11 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             cog,
             ctx,
             role,
-            options="1500 1600 1700 NG",
+            options="1500 1600 1700 NG [3]",
         )
         custom_embed = ctx.send.await_args.kwargs["embed"]
         self.assertTrue(is_auto_start_schedule(custom_embed))
+        self.assertEqual(auto_start_minimum(custom_embed), 3)
         self.assertEqual(
             custom_embed.description,
             "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
@@ -661,6 +695,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             list(DEFAULT_SCHEDULE_OPTION_LIST),
             author,
             auto_start=True,
+            minimum=3,
         )
         poll_message = SimpleNamespace(
             id=99,
@@ -719,6 +754,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             "1️⃣15:00, 2️⃣16:00, 3️⃣17:00, 🆖NG",
         )
         self.assertTrue(is_auto_start_schedule(edited_embed))
+        self.assertEqual(auto_start_minimum(edited_embed), 3)
         self.assertIsNone(announced_start_time(edited_embed))
         self.assertEqual(
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
@@ -924,6 +960,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
                 options,
                 self.harness.creator,
                 auto_start=True,
+                minimum=3,
             )
         ]
         self.harness.set_voters(
@@ -943,11 +980,33 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.harness.channel.send.await_args.kwargs["content"],
-            "17:00 開始 <@&88>",
+            "16:00 開始 <@&88>",
         )
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
-            "17:00",
+            "16:00",
+        )
+
+    async def test_custom_minimum_is_used_in_cancellation_notice(self):
+        self.harness.poll_message.embeds = [
+            build_schedule_embed(
+                self.harness.role,
+                list(DEFAULT_SCHEDULE_OPTION_LIST),
+                self.harness.creator,
+                auto_start=True,
+                minimum=3,
+            )
+        ]
+        await self.announce({"20:00": {2, 3, 4}}, "20:00")
+        self.harness.channel.send.reset_mock()
+        self.harness.set_voters({"20:00": {2, 3}})
+
+        sleep_call, task = await self.queue_check("clear")
+        await self.finish_check(sleep_call, task)
+
+        self.assertIn(
+            "参加可能な投票者が3人未満になりました。",
+            self.harness.channel.send.await_args.kwargs["content"],
         )
 
     async def test_cog_load_prunes_expired_rows_before_recovery(self):

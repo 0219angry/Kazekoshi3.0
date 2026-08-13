@@ -48,26 +48,34 @@ SCHEDULE_ENTRY_PATTERN = re.compile(
     rf"(?:^|, )(?P<emoji>{'|'.join(re.escape(emoji) for emoji in SCHEDULE_REACTION_EMOJIS)})"
 )
 AUTO_START_THRESHOLD = 5
+AUTO_START_MINIMUM_MIN = 1
+AUTO_START_MINIMUM_MAX = 999
 AUTO_START_GRACE_SECONDS = 10
 AUTO_START_MAX_RETRIES = 2
 AUTO_START_NOTICE_RETRY_DELAY_SECONDS = 2
 SCHEDULE_RETENTION_DAYS = 90
 SCHEDULE_REGISTRY_PATH = Path("json/schedule_polls.sqlite3")
-AUTO_START_FOOTER_MARKER = "5人で自動開始判定"
+AUTO_START_MINIMUM_MARKER_PATTERN = (
+    rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で自動開始判定"
+)
+AUTO_START_MINIMUM_PATTERN = re.compile(AUTO_START_MINIMUM_MARKER_PATTERN)
+AUTO_START_MINIMUM_SUFFIX_PATTERN = re.compile(
+    r"(?:^|\s)\[(?P<minimum>-?[0-9]+)\]\s*$"
+)
 AUTO_START_NOTIFIED_MARKER = "初回通知済み"
 AUTO_START_ANNOUNCED_LABEL = "開始通知済み"
 AUTO_START_MESSAGE_ID_LABEL = "通知ID"
 SCHEDULE_CLOSED_MARKER = "投票終了"
 AUTO_START_TIME_PATTERN = r"[^|]+?"
 AUTO_START_FOOTER_PATTERN = re.compile(
-    rf"\|\s*複数選択可\s*\|\s*{AUTO_START_FOOTER_MARKER}\s*"
+    rf"\|\s*複数選択可\s*\|\s*{AUTO_START_MINIMUM_MARKER_PATTERN}\s*"
     rf"(?:\|\s*{AUTO_START_NOTIFIED_MARKER}\s*)?"
     rf"(?:\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*{AUTO_START_TIME_PATTERN}\s*"
     rf"(?:\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*\d+\s*)?)?"
     r"\|\s*作成者ID:\s*\d+\s*$"
 )
 AUTO_START_MARKER_REMOVAL_PATTERN = re.compile(
-    rf"\s*\|\s*{AUTO_START_FOOTER_MARKER}"
+    rf"\s*\|\s*{AUTO_START_MINIMUM_MARKER_PATTERN}"
     rf"(?:\s*\|\s*{AUTO_START_NOTIFIED_MARKER})?"
     rf"(?:\s*\|\s*{AUTO_START_ANNOUNCED_LABEL}:\s*{AUTO_START_TIME_PATTERN}"
     rf"(?:\s*\|\s*{AUTO_START_MESSAGE_ID_LABEL}:\s*\d+)?)?"
@@ -237,6 +245,30 @@ def normalize_auto_start_options(options: list[str]) -> list[str] | None:
     return normalized_times
 
 
+def parse_schedule_add_options(value: str | None) -> tuple[list[str], int]:
+    """add候補と、末尾の `[人数]` で指定された最低人数を解析する。"""
+    minimum = AUTO_START_THRESHOLD
+    option_text = DEFAULT_SCHEDULE_OPTIONS if value is None else value
+    minimum_match = AUTO_START_MINIMUM_SUFFIX_PATTERN.search(option_text)
+    if minimum_match is not None:
+        minimum = int(minimum_match.group("minimum"))
+        if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+            raise ScheduleInputError(
+                f"最低人数は{AUTO_START_MINIMUM_MIN}〜{AUTO_START_MINIMUM_MAX}人で指定してください"
+            )
+        option_text = option_text[:minimum_match.start()].strip()
+        if not option_text:
+            option_text = DEFAULT_SCHEDULE_OPTIONS
+
+    options = parse_schedule_options(option_text)
+    if (
+        minimum_match is not None
+        and normalize_auto_start_options(options) is None
+    ):
+        raise ScheduleInputError("最低人数は時刻形式の候補でのみ指定できます")
+    return options, minimum
+
+
 def format_schedule_options(options: list[str]) -> str:
     emojis = schedule_option_emojis(options)
     return ", ".join(
@@ -343,11 +375,16 @@ def schedule_author_id(embed: discord.Embed) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def auto_start_minimum(embed: discord.Embed) -> int | None:
+    """投票に保存された自動開始の最低人数を返す。"""
+    match = AUTO_START_FOOTER_PATTERN.search(embed.footer.text or "")
+    return int(match.group("minimum")) if match is not None else None
+
+
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
-    footer_text = embed.footer.text or ""
     options = schedule_options_from_embed(embed)
     return (
-        AUTO_START_FOOTER_PATTERN.search(footer_text) is not None
+        auto_start_minimum(embed) is not None
         and options is not None
         and normalize_auto_start_options(options) is not None
     )
@@ -365,11 +402,18 @@ def remove_auto_start_marker(embed: discord.Embed) -> None:
         embed.set_footer(text=updated_footer)
 
 
-def set_auto_start_marker(embed: discord.Embed, *, enabled: bool) -> None:
+def set_auto_start_marker(
+    embed: discord.Embed,
+    *,
+    enabled: bool,
+    minimum: int = AUTO_START_THRESHOLD,
+) -> None:
     """既存状態を消したうえで、自動開始判定マーカーを設定し直す。"""
     remove_auto_start_marker(embed)
     if not enabled:
         return
+    if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+        raise ValueError("auto-start minimum is out of range")
     footer_text = embed.footer.text or ""
     suffix_match = CREATOR_ID_SUFFIX_PATTERN.search(footer_text)
     if suffix_match is None:
@@ -377,7 +421,7 @@ def set_auto_start_marker(embed: discord.Embed, *, enabled: bool) -> None:
     embed.set_footer(
         text=(
             footer_text[:suffix_match.start()]
-            + f" | {AUTO_START_FOOTER_MARKER}"
+            + f" | {minimum}人で自動開始判定"
             + suffix_match.group(0)
         )
     )
@@ -439,7 +483,10 @@ def mark_start_notification_history(embed: discord.Embed) -> None:
         return
     footer_text = embed.footer.text or ""
     suffix_match = CREATOR_ID_SUFFIX_PATTERN.search(footer_text)
-    if suffix_match is None or AUTO_START_FOOTER_MARKER not in footer_text:
+    if (
+        suffix_match is None
+        or AUTO_START_MINIMUM_PATTERN.search(footer_text) is None
+    ):
         return
     updated_footer = (
         footer_text[:suffix_match.start()]
@@ -476,8 +523,11 @@ def mark_start_time_announced(
     embed.set_footer(text=updated_footer)
 
 
-def choose_start_time(voters_by_option: dict[str, set[int]]) -> str | None:
-    """早い時刻側から重複を除いて集計し、5人目が加わる時刻を返す。"""
+def choose_start_time(
+    voters_by_option: dict[str, set[int]],
+    minimum: int = AUTO_START_THRESHOLD,
+) -> str | None:
+    """早い時刻側から重複を除いて集計し、最低人数に達する時刻を返す。"""
     voters_by_time: dict[int, set[int]] = {}
     labels_by_time: dict[int, str] = {}
     for option, voters in voters_by_option.items():
@@ -492,7 +542,7 @@ def choose_start_time(voters_by_option: dict[str, set[int]]) -> str | None:
     distinct_voters: set[int] = set()
     for time_key in sorted(voters_by_time):
         distinct_voters.update(voters_by_time[time_key])
-        if len(distinct_voters) >= AUTO_START_THRESHOLD:
+        if len(distinct_voters) >= minimum:
             return labels_by_time[time_key]
     return None
 
@@ -503,6 +553,7 @@ def build_schedule_embed(
     author,
     *,
     auto_start: bool = False,
+    minimum: int = AUTO_START_THRESHOLD,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=f"{SCHEDULE_TITLE_PREFIX}{role.name} 開始時間",
@@ -511,7 +562,9 @@ def build_schedule_embed(
     )
     footer_parts = [f"作成者: {author.display_name}", "複数選択可"]
     if auto_start:
-        footer_parts.append(AUTO_START_FOOTER_MARKER)
+        if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
+            raise ValueError("auto-start minimum is out of range")
+        footer_parts.append(f"{minimum}人で自動開始判定")
     footer_parts.append(f"作成者ID: {author.id}")
     embed.set_footer(text=" | ".join(footer_parts))
     return embed
@@ -634,7 +687,7 @@ class PollCog(commands.Cog):
         await ctx.send(
             "📅 開始時間投票コマンド\n"
             f"作成: `{prefix}schedule add @ロール [候補...]`\n"
-            f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`\n"
+            f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
             f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
         )
@@ -649,7 +702,10 @@ class PollCog(commands.Cog):
     @schedule.command(name="add", description="新しい開始時間投票を作成します")
     @app_commands.describe(
         role="開始時間調整の対象ロール",
-        options=f"空白区切りの候補（省略時: {DEFAULT_SCHEDULE_OPTIONS}）",
+        options=(
+            f"空白区切りの候補（省略時: {DEFAULT_SCHEDULE_OPTIONS}）。"
+            "末尾の [人数] で最低人数を指定"
+        ),
     )
     @commands.guild_only()
     async def schedule_add(
@@ -666,9 +722,7 @@ class PollCog(commands.Cog):
         self._prune_expired_schedule_polls()
 
         try:
-            option_list = parse_schedule_options(
-                DEFAULT_SCHEDULE_OPTIONS if options is None else options
-            )
+            option_list, minimum = parse_schedule_add_options(options)
         except ScheduleInputError as error:
             await self._send_notice(ctx, f"❌ {error}")
             return
@@ -735,6 +789,7 @@ class PollCog(commands.Cog):
             option_list,
             ctx.author,
             auto_start=auto_start_enabled,
+            minimum=minimum,
         )
         # Prefixコマンドでは元の投稿が既にロールへ通知するため、二重通知を避ける。
         allowed_roles = [role] if ctx.interaction is not None else False
@@ -785,10 +840,11 @@ class PollCog(commands.Cog):
             )
 
         logger.info(
-            "%s created schedule poll %s for role %s",
+            "%s created schedule poll %s for role %s with minimum %s",
             ctx.author,
             poll_message.id,
             role.id,
+            minimum,
         )
 
     @schedule.command(name="update", description="既存の開始時間投票を更新します")
@@ -858,9 +914,14 @@ class PollCog(commands.Cog):
         original_embed = poll_message.embeds[0]
         active_announcement = start_announcement(original_embed)
         auto_start_enabled = normalize_auto_start_options(option_list) is not None
+        minimum = auto_start_minimum(original_embed) or AUTO_START_THRESHOLD
         updated_embed = original_embed.copy()
         updated_embed.description = format_schedule_options(option_list)
-        set_auto_start_marker(updated_embed, enabled=auto_start_enabled)
+        set_auto_start_marker(
+            updated_embed,
+            enabled=auto_start_enabled,
+            minimum=minimum,
+        )
         try:
             await poll_message.edit(embed=updated_embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -1522,7 +1583,12 @@ class PollCog(commands.Cog):
         )
 
         options = schedule_options_from_embed(poll_message.embeds[0])
-        if options is None or normalize_auto_start_options(options) is None:
+        minimum = auto_start_minimum(poll_message.embeds[0])
+        if (
+            options is None
+            or normalize_auto_start_options(options) is None
+            or minimum is None
+        ):
             self._unregister_schedule_poll(message_id)
             return
 
@@ -1534,7 +1600,7 @@ class PollCog(commands.Cog):
         if self._auto_start_revisions.get(message_id) != revision:
             return
 
-        start_time = choose_start_time(voters_by_option)
+        start_time = choose_start_time(voters_by_option, minimum)
         announcement = start_announcement(poll_message.embeds[0])
         current_start_time = (
             announcement.start_time if announcement is not None else None
@@ -1573,6 +1639,7 @@ class PollCog(commands.Cog):
                 poll_message=poll_message,
                 role=role,
                 new_start_time=start_time,
+                minimum=minimum,
                 missing_current_notification=missing_current_notification,
                 cancelled_user_id=cancelled_user_id,
             ),
@@ -1599,6 +1666,7 @@ class PollCog(commands.Cog):
         poll_message: discord.Message,
         role: discord.Role | None,
         new_start_time: str | None,
+        minimum: int,
         missing_current_notification: bool = False,
         cancelled_user_id: int | None = None,
     ) -> None:
@@ -1674,7 +1742,7 @@ class PollCog(commands.Cog):
                 cancellation_detail = (
                     f"{cancelled_user_name}の参加がキャンセルされました。"
                     if cancelled_user_name is not None
-                    else "参加可能な投票者が5人未満になりました。"
+                    else f"参加可能な投票者が{minimum}人未満になりました。"
                 )
                 cancellation_notice = await self._send_cancellation_notice(
                     channel,
@@ -1860,7 +1928,7 @@ class PollCog(commands.Cog):
         logger.info(
             "schedule poll %s reached %s unique voters; announced %s",
             poll_message.id,
-            AUTO_START_THRESHOLD,
+            minimum,
             new_start_time,
         )
 
@@ -2046,7 +2114,8 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule add @ロール [候補...]`\n"
-                f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`",
+                f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`\n"
+                "最低人数を変える場合は末尾に `[人数]` を指定してください",
             )
             return
         if isinstance(error, commands.BadArgument):
