@@ -28,6 +28,7 @@ from kazekoshi.cogs.poll import (
     format_schedule_options,
     is_auto_start_schedule,
     is_schedule_closed,
+    mark_schedule_closed,
     mark_start_time_announced,
     normalize_schedule_time,
     parse_schedule_add_options,
@@ -564,7 +565,7 @@ class ScheduleDisplayTests(unittest.TestCase):
         application_commands = PollCog.schedule.app_command.commands
         self.assertEqual(
             [command.name for command in application_commands],
-            ["add", "status", "minimum", "deadline", "update", "close"],
+            ["add", "status", "clone", "minimum", "deadline", "update", "close"],
         )
         add_command = application_commands[0]
         options_parameter = next(
@@ -690,7 +691,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(schedule_group)
             self.assertEqual(
                 [command.name for command in schedule_group.commands],
-                ["add", "status", "minimum", "deadline", "update", "close"],
+                ["add", "status", "clone", "minimum", "deadline", "update", "close"],
             )
         finally:
             await bot.close()
@@ -785,6 +786,102 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
             ["1️⃣", "2️⃣", "3️⃣", "🆖"],
+        )
+
+    async def test_clone_is_available_to_anyone_and_copies_only_poll_settings(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        requester = SimpleNamespace(id=66, display_name="requester")
+        role = SimpleNamespace(
+            id=88,
+            name="RAID",
+            mention="<@&88>",
+            mentionable=True,
+            is_default=lambda: False,
+        )
+        source_embed = build_schedule_embed(
+            role,
+            ["15:00", "16:00", "17:00", "NG"],
+            creator,
+            auto_start=True,
+            minimum=3,
+        )
+        set_schedule_deadline(source_embed, FIXED_NOW + timedelta(days=1))
+        mark_start_time_announced(source_embed, "16:00", 500)
+        mark_schedule_closed(source_embed)
+        source_embed.title += "（終了）"
+        source_message = SimpleNamespace(
+            id=99,
+            author=bot_user,
+            embeds=[source_embed],
+            role_mentions=[role],
+            content=role.mention,
+        )
+        cloned_message = SimpleNamespace(id=100, add_reaction=AsyncMock())
+        bot_permissions = SimpleNamespace(
+            mention_everyone=True,
+            manage_messages=True,
+            send_messages=True,
+            send_messages_in_threads=True,
+            read_message_history=True,
+            add_reactions=True,
+            embed_links=True,
+        )
+        requester_permissions = SimpleNamespace(
+            manage_messages=False,
+            mention_everyone=False,
+        )
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else requester_permissions
+
+        channel = SimpleNamespace(
+            id=10,
+            name="general",
+            parent=None,
+            permissions_for=permissions_for,
+            fetch_message=AsyncMock(return_value=source_message),
+        )
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(bot, registry=self.registry)
+        cog._queue_auto_start_check_by_id = Mock()
+        ctx = SimpleNamespace(
+            bot=bot,
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=requester,
+            interaction=None,
+            message=SimpleNamespace(role_mentions=[]),
+            send=AsyncMock(return_value=cloned_message),
+        )
+
+        await PollCog.schedule_clone.callback(cog, ctx, "99")
+
+        sent = ctx.send.await_args.kwargs
+        cloned_embed = sent["embed"]
+        self.assertEqual(sent["content"], role.mention)
+        self.assertEqual(sent["allowed_mentions"].roles, [role])
+        self.assertEqual(
+            schedule_options_from_embed(cloned_embed),
+            ["15:00", "16:00", "17:00", "NG"],
+        )
+        self.assertEqual(auto_start_minimum(cloned_embed), 3)
+        self.assertEqual(schedule_author_id(cloned_embed), requester.id)
+        self.assertFalse(is_schedule_closed(cloned_embed))
+        self.assertIsNone(schedule_deadline_at(cloned_embed))
+        self.assertIsNone(start_announcement(cloned_embed))
+        self.assertEqual(
+            [call.args[0] for call in cloned_message.add_reaction.await_args_list],
+            ["1️⃣", "2️⃣", "3️⃣", "🆖"],
+        )
+        self.assertEqual(
+            [poll.message_id for poll in self.registry.all()],
+            [cloned_message.id],
+        )
+        cog._queue_auto_start_check_by_id.assert_called_once_with(
+            guild_id=1,
+            channel_id=10,
+            message_id=cloned_message.id,
         )
 
     async def test_add_prunes_expired_registry_rows_before_registering_new_poll(self):

@@ -26,7 +26,7 @@ source venv/bin/activate && python Kazekoshi.py
 
 ### ロール開始時間投票
 
-サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule close` を使用でき、
+サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule close` を使用でき、
 対象には `@VALORANT` 以外も含む任意のロールを指定できます。
 `/schedule add` で対象ロールだけを指定した場合、候補には
 `20:00 20:30 21:00 21:30 22:00 22:30 23:00 24:00 NG` が自動で入ります。
@@ -44,6 +44,8 @@ source venv/bin/activate && python Kazekoshi.py
 集計対象は対象ロールの所属有無にかかわらず、その投票へ反応したBot以外のユーザーです。
 `/schedule status message:<投稿IDまたはリンク>` では、候補ごとの票数、時刻順に重複を除いた
 累計人数、現在の成立時刻を確認できます。スラッシュコマンドでは結果を実行者だけに表示します。
+`/schedule clone message:<投稿IDまたはリンク>` は誰でも実行でき、元投票のロール・候補・最低人数で
+新しい投票を作ります。既存票・締切・開始通知・終了状態は引き継ぎません。
 `/schedule deadline` では、日本時間の `YYYY-MM-DD HH:MM` 形式で90日以内の締切を設定できます。
 締切は再起動後も復元され、時刻になると開始通知を取り消して投票を自動終了します。`clear` または
 `解除` を指定すると締切を取り消せます。

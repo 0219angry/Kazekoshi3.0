@@ -1017,6 +1017,7 @@ class PollCog(commands.Cog):
             f"作成: `{prefix}schedule add @ロール [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"状況確認: `{prefix}schedule status <投稿IDまたはリンク>`\n"
+            f"複製: `{prefix}schedule clone <投稿IDまたはリンク>`\n"
             f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
             f"締切設定: `{prefix}schedule deadline <投稿IDまたはリンク> 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
@@ -1057,7 +1058,6 @@ class PollCog(commands.Cog):
         except ScheduleInputError as error:
             await self._send_notice(ctx, f"❌ {error}")
             return
-        auto_start_enabled = normalize_auto_start_options(option_list) is not None
 
         if role.is_default():
             await self._send_notice(ctx, "❌ @everyone は日程調整の対象にできません")
@@ -1073,10 +1073,28 @@ class PollCog(commands.Cog):
             )
             return
 
+        await self._create_schedule_poll(
+            ctx,
+            role,
+            option_list,
+            minimum,
+            role_already_mentioned=ctx.interaction is None,
+        )
+
+    async def _create_schedule_poll(
+        self,
+        ctx: commands.Context,
+        role: discord.Role,
+        option_list: list[str],
+        minimum: int,
+        *,
+        role_already_mentioned: bool,
+    ) -> discord.Message | None:
+        auto_start_enabled = normalize_auto_start_options(option_list) is not None
         bot_member = ctx.guild.me
         if bot_member is None:
             await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
-            return
+            return None
         bot_permissions = ctx.channel.permissions_for(bot_member)
         can_send = (
             bot_permissions.send_messages_in_threads
@@ -1097,7 +1115,7 @@ class PollCog(commands.Cog):
                 ctx,
                 "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
             )
-            return
+            return None
 
         if not role.mentionable:
             author_permissions = ctx.channel.permissions_for(ctx.author)
@@ -1106,14 +1124,14 @@ class PollCog(commands.Cog):
                     ctx,
                     "❌ メンション不可のロールを指定する権限がありません",
                 )
-                return
-            if ctx.interaction is not None or auto_start_enabled:
+                return None
+            if not role_already_mentioned or auto_start_enabled:
                 if not bot_permissions.mention_everyone:
                     await self._send_notice(
                         ctx,
                         "❌ Botに「@everyone、@here、すべてのロールにメンション」の権限が必要です",
                     )
-                    return
+                    return None
 
         embed = build_schedule_embed(
             role,
@@ -1122,8 +1140,8 @@ class PollCog(commands.Cog):
             auto_start=auto_start_enabled,
             minimum=minimum,
         )
-        # Prefixコマンドでは元の投稿が既にロールへ通知するため、二重通知を避ける。
-        allowed_roles = [role] if ctx.interaction is not None else False
+        # addのPrefixコマンドだけは、元投稿で既に通知しているため二重通知を避ける。
+        allowed_roles = False if role_already_mentioned else [role]
         allowed_mentions = discord.AllowedMentions(
             everyone=False,
             users=False,
@@ -1161,7 +1179,7 @@ class PollCog(commands.Cog):
                 ctx,
                 "❌ 投票の作成に失敗しました。Botの送信・埋め込み・リアクション権限を確認してください",
             )
-            return
+            return None
 
         if auto_start_enabled and getattr(self.bot, "user", None) is not None:
             self._queue_auto_start_check_by_id(
@@ -1177,6 +1195,7 @@ class PollCog(commands.Cog):
             role.id,
             minimum,
         )
+        return poll_message
 
     @schedule.command(name="status", description="開始時間投票の現在状況を表示します")
     @app_commands.describe(
@@ -1243,6 +1262,67 @@ class PollCog(commands.Cog):
         )
         status_embed.url = poll_message.jump_url
         await self._send_embed_notice(ctx, status_embed)
+
+    @schedule.command(name="clone", description="開始時間投票の設定を複製します")
+    @app_commands.describe(
+        message="複製する開始時間投票の投稿IDまたはリンク",
+    )
+    @commands.guild_only()
+    async def schedule_clone(
+        self,
+        ctx: commands.Context,
+        message: str,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        try:
+            message_id, link_channel_id = parse_message_id(message)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+        if link_channel_id is not None and link_channel_id != ctx.channel.id:
+            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+            return
+
+        source_message = await self._fetch_schedule_poll(ctx, message_id)
+        if source_message is None:
+            return
+        source_embed = source_message.embeds[0]
+        options = schedule_options_from_embed(source_embed)
+        if options is None:
+            await self._send_notice(ctx, "❌ 投票の候補を読み取れませんでした")
+            return
+        normalized_options = normalize_auto_start_options(options)
+        if normalized_options is not None:
+            options = normalized_options
+
+        role = self._schedule_role(source_message)
+        if role is None:
+            await self._send_notice(
+                ctx,
+                "❌ 元の投票の対象ロールが削除されているため複製できません",
+            )
+            return
+        if role.is_default():
+            await self._send_notice(ctx, "❌ @everyone は日程調整の対象にできません")
+            return
+
+        self._prune_expired_schedule_polls()
+        minimum = schedule_minimum(source_embed) or AUTO_START_THRESHOLD
+        cloned_message = await self._create_schedule_poll(
+            ctx,
+            role,
+            options,
+            minimum,
+            role_already_mentioned=False,
+        )
+        if cloned_message is not None:
+            logger.info(
+                "%s cloned schedule poll %s as %s",
+                ctx.author,
+                message_id,
+                cloned_message.id,
+            )
 
     @schedule.command(
         name="minimum",
@@ -3015,6 +3095,19 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule status <投稿IDまたはリンク>`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_clone.error
+    async def schedule_clone_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule clone <投稿IDまたはリンク>`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
