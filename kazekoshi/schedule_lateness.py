@@ -363,6 +363,26 @@ class ScheduleLatenessRegistry:
             ).fetchone()
         return row is not None
 
+    def delete_poll(self, poll_message_id: int) -> bool:
+        """募集に紐づく遅刻判定・参加者・到着・無効化設定を完全削除する。"""
+        with closing(self._connect()) as connection:
+            with connection:
+                event_cursor = connection.execute(
+                    """
+                    DELETE FROM schedule_lateness_events
+                    WHERE poll_message_id = ?
+                    """,
+                    (poll_message_id,),
+                )
+                disabled_cursor = connection.execute(
+                    """
+                    DELETE FROM schedule_lateness_disabled
+                    WHERE poll_message_id = ?
+                    """,
+                    (poll_message_id,),
+                )
+        return event_cursor.rowcount > 0 or disabled_cursor.rowcount > 0
+
     def cancel_pending(self, poll_message_id: int) -> bool:
         with closing(self._connect()) as connection:
             with connection:

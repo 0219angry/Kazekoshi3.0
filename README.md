@@ -26,9 +26,9 @@ source venv/bin/activate && python Kazekoshi.py
 
 ### ロール開始時間投票
 
-サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule date`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule decide`、`/schedule late`、`/schedule lateoff`、`/schedule close` を使用でき、
+サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule date`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule decide`、`/schedule late`、`/schedule lateoff`、`/schedule close`、`/schedule delete` を使用でき、
 対象には `@VALORANT` 以外も含む任意のロールを指定できます。
-`status`、`clone`、`date`、`minimum`、`deadline`、`update`、`decide`、`lateoff`、`close` は
+`status`、`clone`、`date`、`minimum`、`deadline`、`update`、`decide`、`lateoff`、`close`、`delete` は
 投稿ID・リンクを省略でき、省略時は同じチャンネルの直近100件から最新の開始時間投票を対象にします。
 `/schedule add` で対象ロールだけを指定した場合、候補には
 `20:00 20:30 21:00 21:30 22:00 22:30 23:00 24:00 NG` が自動で入ります。
@@ -90,6 +90,10 @@ Bot再起動時点ですでにVCにいる人は、誤って遅刻扱いにしな
 登録だけを削除して自動判定を終了します。Discord上の投票投稿と通知は削除しません。
 3か月を待たずに使い終わった投票は `/schedule close` で終了すると、古い投票による将来の
 誤通知を防げます。
+募集投稿自体が不要になった場合は `/schedule delete message:<投稿IDまたはリンク>` で完全削除できます。
+作成者またはメッセージ管理権限を持つ人だけが実行でき、投稿指定は省略可能です。募集投稿に加えて、
+自動判定・締切・遅刻判定・遅刻統計の関連データと、追跡できる開始／確定通知も削除します。この操作は
+元に戻せません。
 `json/` はBotから書き込め、再起動後も残るディスクに置いてください。通知の重複を避けるため、
 Botは1プロセス（1レプリカ）での運用を前提とします。
 

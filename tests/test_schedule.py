@@ -43,6 +43,7 @@ from kazekoshi.cogs.poll import (
     schedule_event_date,
     schedule_option_emojis,
     schedule_options_from_embed,
+    schedule_related_notification_id,
     set_auto_start_minimum,
     set_schedule_decision,
     set_schedule_date_override,
@@ -641,6 +642,7 @@ class ScheduleDisplayTests(unittest.TestCase):
                 "late",
                 "lateoff",
                 "close",
+                "delete",
             ],
         )
         add_command = application_commands[0]
@@ -669,6 +671,7 @@ class ScheduleDisplayTests(unittest.TestCase):
             "decide",
             "lateoff",
             "close",
+            "delete",
         ):
             command = next(
                 command
@@ -812,6 +815,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                     "late",
                     "lateoff",
                     "close",
+                    "delete",
                 ],
             )
         finally:
@@ -1164,6 +1168,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schedule_decided_start_time(decided_embed), "21:00")
         self.assertIsNone(schedule_deadline_at(decided_embed))
         self.assertIsNone(start_announcement(decided_embed))
+        self.assertEqual(schedule_related_notification_id(decided_embed), 500)
         self.assertEqual(self.registry.all(), [])
         self.assertIn("21:00 開始で確定", ctx.send.await_args.args[0])
 
@@ -1173,6 +1178,100 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
 
         channel.send.assert_not_awaited()
         self.assertIn("21:00 開始で確定しています", ctx.send.await_args.args[0])
+
+    async def test_delete_removes_latest_poll_notification_and_related_data(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        role = SimpleNamespace(name="RAID")
+        embed = build_schedule_embed(
+            role,
+            ["20:00", "21:00", "NG"],
+            creator,
+            auto_start=True,
+        )
+        mark_start_time_announced(embed, "21:00", 500)
+        poll_message = SimpleNamespace(
+            id=99,
+            author=bot_user,
+            embeds=[embed],
+            delete=AsyncMock(),
+        )
+        notification = SimpleNamespace(
+            id=500,
+            author=bot_user,
+            delete=AsyncMock(),
+        )
+        bot_permissions = SimpleNamespace(read_message_history=True)
+        creator_permissions = SimpleNamespace(manage_messages=False)
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else creator_permissions
+
+        async def fetch_message(message_id):
+            return {99: poll_message, 500: notification}[message_id]
+
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=permissions_for,
+            fetch_message=AsyncMock(side_effect=fetch_message),
+        )
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(bot, registry=self.registry)
+        cog._register_schedule_poll(guild_id=1, channel_id=10, message_id=99)
+        event = cog._lateness_registry.upsert_event(
+            poll_message_id=99,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 10),
+            start_time="21:00",
+            minimum=5,
+            start_at=FIXED_NOW,
+            finalized=True,
+        )
+        cog._lateness_registry.snapshot_participants(
+            99,
+            {2},
+            snapshotted_at=event.snapshot_at,
+        )
+        cog._lateness_registry.activate(
+            99,
+            voice_channel_id=20,
+            activated_at=FIXED_NOW + timedelta(minutes=1),
+            arrivals={2: FIXED_NOW + timedelta(minutes=1)},
+        )
+        self.assertTrue(
+            cog._lateness_registry.monthly_stats(
+                guild_id=1,
+                month=date(2026, 8, 1),
+            )
+        )
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=creator,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+        cog._resolve_schedule_message_id = AsyncMock(return_value=99)
+
+        await PollCog.schedule_delete.callback(cog, ctx)
+
+        cog._resolve_schedule_message_id.assert_awaited_once_with(ctx, None)
+        ctx.defer.assert_awaited_once_with(ephemeral=True)
+        poll_message.delete.assert_awaited_once_with()
+        notification.delete.assert_awaited_once_with()
+        self.assertEqual(self.registry.all(), [])
+        self.assertIsNone(cog._lateness_registry.get_event(99))
+        self.assertEqual(
+            cog._lateness_registry.monthly_stats(
+                guild_id=1,
+                month=date(2026, 8, 1),
+            ),
+            [],
+        )
+        self.assertNotIn(99, cog._registered_schedule_ids)
+        self.assertIn("完全削除", ctx.send.await_args.args[0])
 
     async def test_add_prunes_expired_registry_rows_before_registering_new_poll(self):
         expired_id = schedule_snowflake(
@@ -1912,6 +2011,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         decided_embed = self.harness.poll_message.embeds[0]
         self.assertTrue(is_schedule_closed(decided_embed))
         self.assertEqual(schedule_decided_start_time(decided_embed), "20:00")
+        self.assertEqual(
+            schedule_related_notification_id(decided_embed),
+            notification.id,
+        )
         self.assertEqual(self.registry.all(), [])
 
     async def test_decide_replaces_different_auto_start_without_reping_role(self):
@@ -1940,6 +2043,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         decided_embed = self.harness.poll_message.embeds[0]
         self.assertTrue(is_schedule_closed(decided_embed))
         self.assertEqual(schedule_decided_start_time(decided_embed), "21:00")
+        self.assertEqual(
+            schedule_related_notification_id(decided_embed),
+            self.harness.notifications[1001].id,
+        )
         self.assertEqual(self.registry.all(), [])
 
     async def test_custom_compact_times_are_normalized_and_auto_evaluated(self):
@@ -3116,6 +3223,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_auto_start_schedule(embed))
         self.assertEqual(embed.title, "📅 GAME 開始時間 [5人]（終了）")
         self.assertIn("投票終了", embed.footer.text)
+        self.assertEqual(
+            schedule_related_notification_id(embed),
+            old_notification.id,
+        )
         self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("投票が終了", old_notification.content)
         self.assertEqual(self.registry.all(), [])

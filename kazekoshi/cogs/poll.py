@@ -77,6 +77,7 @@ SCHEDULE_DEADLINE_MAX_DAYS = 90
 SCHEDULE_DEADLINE_FIELD_NAME = "締切"
 SCHEDULE_DEADLINE_VALUE_PATTERN = re.compile(r"<t:(?P<timestamp>\d+):F>")
 SCHEDULE_DECISION_FIELD_NAME = "確定開始"
+SCHEDULE_RELATED_NOTIFICATION_ID_LABEL = "関連通知ID"
 SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
 LATEST_SCHEDULE_HISTORY_LIMIT = 100
@@ -123,6 +124,9 @@ AUTO_START_NOTIFIED_PATTERN = re.compile(
     r"\|\s*作成者ID:\s*\d+\s*$)"
 )
 CREATOR_ID_SUFFIX_PATTERN = re.compile(r"\s*\|\s*作成者ID:\s*\d+\s*$")
+SCHEDULE_RELATED_NOTIFICATION_ID_PATTERN = re.compile(
+    rf"\s*\|\s*{SCHEDULE_RELATED_NOTIFICATION_ID_LABEL}:\s*(?P<message_id>\d+)"
+)
 _CANCELLED_USER_UNCHANGED = object()
 
 
@@ -824,6 +828,37 @@ def set_schedule_decision(
         )
 
 
+def schedule_related_notification_id(embed: discord.Embed) -> int | None:
+    """終了後も削除対象として追跡する通知投稿IDを返す。"""
+    match = SCHEDULE_RELATED_NOTIFICATION_ID_PATTERN.search(
+        embed.footer.text or ""
+    )
+    return int(match.group("message_id")) if match is not None else None
+
+
+def set_schedule_related_notification_id(
+    embed: discord.Embed,
+    message_id: int | None,
+) -> None:
+    footer_text = SCHEDULE_RELATED_NOTIFICATION_ID_PATTERN.sub(
+        "",
+        embed.footer.text or "",
+    )
+    if message_id is None:
+        embed.set_footer(text=footer_text)
+        return
+    suffix_match = CREATOR_ID_SUFFIX_PATTERN.search(footer_text)
+    if suffix_match is None:
+        return
+    embed.set_footer(
+        text=(
+            footer_text[:suffix_match.start()]
+            + f" | {SCHEDULE_RELATED_NOTIFICATION_ID_LABEL}: {message_id}"
+            + suffix_match.group(0)
+        )
+    )
+
+
 def schedule_date_override(embed: discord.Embed) -> date | None:
     for field in embed.fields:
         if field.name != SCHEDULE_DATE_FIELD_NAME:
@@ -1431,7 +1466,8 @@ class PollCog(commands.Cog):
             f"確定: `{prefix}schedule decide [投稿IDまたはリンク] 21:00`\n"
             f"遅刻集計: `{prefix}schedule late [期間]`\n"
             f"遅刻判定停止: `{prefix}schedule lateoff [投稿IDまたはリンク]`\n"
-            f"終了: `{prefix}schedule close [投稿IDまたはリンク]`"
+            f"終了: `{prefix}schedule close [投稿IDまたはリンク]`\n"
+            f"完全削除: `{prefix}schedule delete [投稿IDまたはリンク]`"
         )
 
     @schedule.error
@@ -2586,6 +2622,14 @@ class PollCog(commands.Cog):
             set_schedule_decision(decided_embed, decided_start_time)
             set_schedule_deadline(decided_embed, None)
             mark_schedule_closed(decided_embed)
+            decision_notification = (
+                old_notification if reused_notification else new_notification
+            )
+            if decision_notification is not None:
+                set_schedule_related_notification_id(
+                    decided_embed,
+                    decision_notification.id,
+                )
             if decided_embed.title and not decided_embed.title.endswith("（終了）"):
                 decided_embed.title += "（終了）"
             await poll_message.edit(embed=decided_embed)
@@ -2844,6 +2888,114 @@ class PollCog(commands.Cog):
             )
             logger.info("%s closed schedule poll %s", ctx.author, message_id)
 
+    @schedule.command(
+        name="delete",
+        description="開始時間投票の投稿と関連データを完全削除します",
+    )
+    @app_commands.describe(
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
+    )
+    @commands.guild_only()
+    async def schedule_delete(
+        self,
+        ctx: commands.Context,
+        message: Optional[str] = None,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        if not bot_permissions.read_message_history:
+            await self._send_notice(
+                ctx,
+                "❌ Botに「メッセージ履歴を読む」権限が必要です",
+            )
+            return
+
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            poll_message = await self._fetch_editable_schedule_poll(
+                ctx,
+                message_id,
+            )
+            if poll_message is None:
+                return
+
+            embed = poll_message.embeds[0]
+            announcement = start_announcement(embed)
+            notification_id = (
+                schedule_related_notification_id(embed)
+                or (
+                    announcement.message_id
+                    if announcement is not None
+                    else None
+                )
+                or self._poll_notification_ids.get(message_id)
+            )
+            notification = None
+            notification_warning = ""
+            if notification_id is not None:
+                try:
+                    notification = await self._fetch_start_notification(
+                        ctx.channel,
+                        StartAnnouncement("", notification_id),
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "failed to fetch related notification while deleting poll %s",
+                        message_id,
+                    )
+                    notification_warning = (
+                        "\n⚠️ 関連する開始通知を取得できなかったため、"
+                        "通知は削除できませんでした"
+                    )
+
+            try:
+                await poll_message.delete()
+            except discord.NotFound:
+                # 取得後に別操作で削除された場合も、関連データの削除は続ける。
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("failed to delete schedule poll %s", message_id)
+                await self._send_notice(
+                    ctx,
+                    "❌ 開始時間投票の投稿を削除できませんでした",
+                )
+                return
+
+            self._invalidate_auto_start_check(message_id)
+            self._delete_lateness_event(message_id)
+            self._unregister_schedule_poll(message_id)
+
+            if notification is not None:
+                try:
+                    await notification.delete()
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "failed to delete related notification for poll %s",
+                        message_id,
+                    )
+                    notification_warning = (
+                        "\n⚠️ 関連する開始通知は削除できませんでした"
+                    )
+
+            await self._send_notice(
+                ctx,
+                "✅ 開始時間投票の投稿と関連データを完全削除しました"
+                f"{notification_warning}",
+            )
+            logger.info("%s deleted schedule poll %s", ctx.author, message_id)
+
     async def _close_schedule_poll_message(
         self,
         channel,
@@ -2856,8 +3008,22 @@ class PollCog(commands.Cog):
         self._invalidate_auto_start_check(message_id)
         original_embed = poll_message.embeds[0]
         active_announcement = start_announcement(original_embed)
+        related_notification_id = (
+            schedule_related_notification_id(original_embed)
+            or (
+                active_announcement.message_id
+                if active_announcement is not None
+                else None
+            )
+            or self._poll_notification_ids.get(message_id)
+        )
         closed_embed = original_embed.copy()
         mark_schedule_closed(closed_embed)
+        if related_notification_id is not None:
+            set_schedule_related_notification_id(
+                closed_embed,
+                related_notification_id,
+            )
         if closed_embed.title and not closed_embed.title.endswith("（終了）"):
             closed_embed.title += "（終了）"
         await poll_message.edit(embed=closed_embed)
@@ -3378,7 +3544,7 @@ class PollCog(commands.Cog):
             self._queue_lateness_event_task(event)
         return event
 
-    def _cancel_lateness_event(self, poll_message_id: int) -> bool:
+    def _stop_lateness_tasks(self, poll_message_id: int) -> None:
         try:
             current_task = asyncio.current_task()
         except RuntimeError:
@@ -3392,11 +3558,25 @@ class PollCog(commands.Cog):
         )
         if reaction_task is not None and reaction_task is not current_task:
             reaction_task.cancel()
+
+    def _cancel_lateness_event(self, poll_message_id: int) -> bool:
+        self._stop_lateness_tasks(poll_message_id)
         try:
             return self._lateness_registry.cancel_pending(poll_message_id)
         except (sqlite3.Error, OSError):
             logger.exception(
                 "failed to cancel lateness event for schedule poll %s",
+                poll_message_id,
+            )
+            return False
+
+    def _delete_lateness_event(self, poll_message_id: int) -> bool:
+        self._stop_lateness_tasks(poll_message_id)
+        try:
+            return self._lateness_registry.delete_poll(poll_message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to delete lateness data for schedule poll %s",
                 poll_message_id,
             )
             return False
@@ -3979,7 +4159,8 @@ class PollCog(commands.Cog):
         message_id: int,
         channel_id: int,
     ) -> None:
-        self._cancel_lateness_event(message_id)
+        # Discord上で直接削除された場合も、遅刻統計を孤立させない。
+        self._delete_lateness_event(message_id)
         poll = self._notification_poll_refs.pop(message_id, None)
         if poll is not None:
             self._poll_notification_ids.pop(poll.message_id, None)
@@ -4979,6 +5160,13 @@ class PollCog(commands.Cog):
                 "❌ 使い方: `/schedule close [投稿IDまたはリンク]`",
             )
             return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_delete.error
+    async def schedule_delete_error(self, ctx, error):
         if isinstance(error, commands.NoPrivateMessage):
             await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
             return

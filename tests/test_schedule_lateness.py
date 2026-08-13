@@ -438,6 +438,40 @@ class ScheduleLatenessRegistryTests(unittest.TestCase):
             0,
         )
 
+    def test_delete_poll_purges_event_attendance_and_disabled_marker(self):
+        event = self.create_event()
+        self.registry.snapshot_participants(
+            event.poll_message_id,
+            {2},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=1),
+            arrivals={2: START_AT + timedelta(minutes=1)},
+        )
+        self.assertTrue(
+            self.registry.monthly_stats(
+                guild_id=1,
+                month=date(2026, 8, 1),
+            )
+        )
+        self.registry.disable_poll(
+            poll_message_id=event.poll_message_id,
+            guild_id=1,
+            channel_id=10,
+            disabled_at=START_AT + timedelta(minutes=2),
+        )
+
+        self.assertTrue(self.registry.delete_poll(event.poll_message_id))
+
+        self.assertIsNone(self.registry.get_event(event.poll_message_id))
+        self.assertEqual(self.registry.participants(event.poll_message_id), [])
+        self.assertEqual(self.registry.attendance(event.poll_message_id), [])
+        self.assertFalse(self.registry.is_disabled(event.poll_message_id))
+        self.assertFalse(self.registry.delete_poll(event.poll_message_id))
+
 
 class ScheduleLatenessVoiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -693,6 +727,48 @@ class ScheduleLatenessVoiceTests(unittest.IsolatedAsyncioTestCase):
                 start_time="21:00",
                 current_eligible_user_ids={2, 3, 4},
             )
+        )
+
+    async def test_directly_deleted_poll_is_removed_from_lateness_stats(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=5,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.lateness_registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=1),
+            arrivals={2: START_AT + timedelta(minutes=1)},
+        )
+        self.assertTrue(
+            self.lateness_registry.monthly_stats(
+                guild_id=1,
+                month=date(2026, 8, 1),
+            )
+        )
+
+        await self.cog.on_raw_message_delete(
+            SimpleNamespace(message_id=100, channel_id=10)
+        )
+
+        self.assertIsNone(self.lateness_registry.get_event(100))
+        self.assertEqual(
+            self.lateness_registry.monthly_stats(
+                guild_id=1,
+                month=date(2026, 8, 1),
+            ),
+            [],
         )
 
     async def test_tracking_task_finalizes_absence_after_three_hours(self):
