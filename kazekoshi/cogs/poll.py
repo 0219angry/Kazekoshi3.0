@@ -16,6 +16,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from kazekoshi.schedule_lateness import (
+    LATENESS_TRACKING_HOURS,
+    ScheduleLatenessEvent,
+    ScheduleLatenessRegistry,
+    lateness_voice_quorum,
+)
+
 logger = getLogger(__name__)
 EMOJI_NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
 EMOJI_LETTERS = [chr(0x1F1E6 + index) for index in range(26)]
@@ -72,6 +79,7 @@ SCHEDULE_DECISION_FIELD_NAME = "確定開始"
 SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
 LATEST_SCHEDULE_HISTORY_LIMIT = 100
+LATENESS_REACTION_GRACE_SECONDS = 2
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -722,6 +730,49 @@ def schedule_event_date(poll_message: discord.Message) -> date:
     return schedule_default_date(poll_message)
 
 
+def schedule_start_datetime(event_date: date, start_time: str) -> datetime:
+    """開催日と正規化済み時刻を、UTCの開始日時へ変換する。"""
+    normalized_time = normalize_schedule_time(start_time)
+    if normalized_time is None:
+        raise ValueError("invalid schedule start time")
+    hour, minute = (int(part) for part in normalized_time.split(":"))
+    if hour == 24:
+        event_date += timedelta(days=1)
+        hour = 0
+    local_start = datetime(
+        event_date.year,
+        event_date.month,
+        event_date.day,
+        hour,
+        minute,
+        tzinfo=SCHEDULE_TIMEZONE,
+    )
+    return local_start.astimezone(timezone.utc)
+
+
+def eligible_voters_for_start(
+    voters_by_option: dict[str, set[int]],
+    start_time: str,
+) -> set[int]:
+    """確定時刻以前を選んだ、参加可能な投票者を重複なしで返す。"""
+    normalized_start = normalize_schedule_time(start_time)
+    if normalized_start is None:
+        return set()
+    start_hour, start_minute = (
+        int(part) for part in normalized_start.split(":")
+    )
+    start_key = start_hour * 60 + start_minute
+    eligible: set[int] = set()
+    for option, user_ids in voters_by_option.items():
+        normalized_option = normalize_schedule_time(option)
+        if normalized_option is None:
+            continue
+        hour, minute = (int(part) for part in normalized_option.split(":"))
+        if hour * 60 + minute <= start_key:
+            eligible.update(user_ids)
+    return eligible
+
+
 def is_auto_start_schedule(embed: discord.Embed) -> bool:
     options = schedule_options_from_embed(embed)
     return (
@@ -1051,16 +1102,24 @@ class PollCog(commands.Cog):
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         retry_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         deadline_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        lateness_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        lateness_reaction_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         registry: SchedulePollRegistry | None = None,
+        lateness_registry: ScheduleLatenessRegistry | None = None,
     ):
         self.bot = bot
         self._auto_start_grace_seconds = auto_start_grace_seconds
         self._sleep = sleeper
         self._retry_sleep = retry_sleeper
         self._deadline_sleep = deadline_sleeper
+        self._lateness_sleep = lateness_sleeper
+        self._lateness_reaction_sleep = lateness_reaction_sleeper
         self._now = now_provider
         self._schedule_registry = registry or SchedulePollRegistry()
+        self._lateness_registry = lateness_registry or ScheduleLatenessRegistry(
+            self._schedule_registry.path
+        )
         self._auto_start_locks: WeakValueDictionary[int, asyncio.Lock] = (
             WeakValueDictionary()
         )
@@ -1074,6 +1133,9 @@ class PollCog(commands.Cog):
         self._poll_notification_ids: dict[int, int] = {}
         self._notification_poll_refs: dict[int, RegisteredSchedulePoll] = {}
         self._deadline_tasks: dict[int, asyncio.Task] = {}
+        self._lateness_tasks: dict[int, asyncio.Task] = {}
+        self._lateness_reaction_tasks: dict[int, asyncio.Task] = {}
+        self._lateness_tracking_started = False
         self._registry_recovery_task: asyncio.Task | None = None
 
     def _utc_now(self) -> datetime:
@@ -1084,31 +1146,48 @@ class PollCog(commands.Cog):
 
     async def cog_load(self) -> None:
         self._prune_expired_schedule_polls()
+        polls: list[RegisteredSchedulePoll] = []
         try:
             polls = self._schedule_registry.all()
         except (sqlite3.Error, OSError):
             logger.exception("failed to load the schedule poll registry")
-            return
-        loaded_ids = {poll.message_id for poll in polls}
-        self._registered_schedule_ids.update(loaded_ids)
-        self._persisted_schedule_ids.update(loaded_ids)
-        self._registered_schedule_polls.update(
-            {poll.message_id: poll for poll in polls}
-        )
-        if not polls or not hasattr(self.bot, "wait_until_ready"):
-            return
-        self._registry_recovery_task = asyncio.create_task(
-            self._recover_registered_schedule_polls(polls),
-            name="schedule-poll-recovery",
-        )
+        else:
+            loaded_ids = {poll.message_id for poll in polls}
+            self._registered_schedule_ids.update(loaded_ids)
+            self._persisted_schedule_ids.update(loaded_ids)
+            self._registered_schedule_polls.update(
+                {poll.message_id: poll for poll in polls}
+            )
+            if polls and hasattr(self.bot, "wait_until_ready"):
+                self._registry_recovery_task = asyncio.create_task(
+                    self._recover_registered_schedule_polls(polls),
+                    name="schedule-poll-recovery",
+                )
+
+        self._lateness_tracking_started = True
+        try:
+            self._lateness_registry.prune_expired_presence(now=self._utc_now())
+            lateness_events = self._lateness_registry.tracking_events(
+                now=self._utc_now()
+            )
+        except (sqlite3.Error, OSError):
+            logger.exception("failed to load schedule lateness tracking")
+        else:
+            for event in lateness_events:
+                self._queue_lateness_event_task(event)
 
     async def cog_unload(self) -> None:
         if self._registry_recovery_task is not None:
             self._registry_recovery_task.cancel()
         tasks = list(self._auto_start_tasks.values())
         deadline_tasks = list(self._deadline_tasks.values())
+        lateness_tasks = list(self._lateness_tasks.values())
+        lateness_reaction_tasks = list(self._lateness_reaction_tasks.values())
         self._auto_start_tasks.clear()
         self._deadline_tasks.clear()
+        self._lateness_tasks.clear()
+        self._lateness_reaction_tasks.clear()
+        self._lateness_tracking_started = False
         self._auto_start_revisions.clear()
         self._last_cancelled_user_ids.clear()
         self._start_notified_poll_ids.clear()
@@ -1116,7 +1195,16 @@ class PollCog(commands.Cog):
             task.cancel()
         for task in deadline_tasks:
             task.cancel()
-        pending_tasks = [*tasks, *deadline_tasks]
+        for task in lateness_tasks:
+            task.cancel()
+        for task in lateness_reaction_tasks:
+            task.cancel()
+        pending_tasks = [
+            *tasks,
+            *deadline_tasks,
+            *lateness_tasks,
+            *lateness_reaction_tasks,
+        ]
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         if self._registry_recovery_task is not None:
@@ -1187,6 +1275,7 @@ class PollCog(commands.Cog):
             f"締切設定: `{prefix}schedule deadline [投稿IDまたはリンク] 2026-08-14 19:00`\n"
             f"更新: `{prefix}schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`\n"
             f"確定: `{prefix}schedule decide [投稿IDまたはリンク] 21:00`\n"
+            f"遅刻判定停止: `{prefix}schedule lateoff [投稿IDまたはリンク]`\n"
             f"終了: `{prefix}schedule close [投稿IDまたはリンク]`"
         )
 
@@ -1560,6 +1649,27 @@ class PollCog(commands.Cog):
             )
             return
 
+        effective_date = stored_date or default_date
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event while changing poll date %s",
+                message_id,
+            )
+            await self._send_notice(ctx, "❌ 遅刻判定の状態を確認できませんでした")
+            return
+        if (
+            lateness_event is not None
+            and lateness_event.activated_at is not None
+            and lateness_event.event_date != effective_date
+        ):
+            await self._send_notice(
+                ctx,
+                "❌ VCでの遅刻判定が始まった後は開催日を変更できません",
+            )
+            return
+
         updated_embed = original_embed.copy()
         set_schedule_date_override(updated_embed, stored_date)
         try:
@@ -1569,7 +1679,19 @@ class PollCog(commands.Cog):
             await self._send_notice(ctx, "❌ 開催日を変更できませんでした")
             return
 
-        effective_date = stored_date or default_date
+        tracked_start_time = (
+            schedule_decided_start_time(original_embed)
+            or announced_start_time(original_embed)
+        )
+        if tracked_start_time is not None:
+            await self._store_lateness_event(
+                poll_message,
+                guild_id=ctx.guild.id,
+                channel_id=ctx.channel.id,
+                start_time=tracked_start_time,
+                finalized=schedule_decided_start_time(original_embed) is not None,
+                event_date=effective_date,
+            )
         action = (
             f"開催日を{effective_date.isoformat()}に設定しました"
             if stored_date is not None
@@ -1658,6 +1780,20 @@ class PollCog(commands.Cog):
             return
 
         original_embed = poll_message.embeds[0]
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event while changing minimum %s",
+                message_id,
+            )
+            lateness_event = None
+        if lateness_event is not None and lateness_event.activated_at is not None:
+            await self._send_notice(
+                ctx,
+                "❌ VCでの遅刻判定が始まった後は最低人数を変更できません",
+            )
+            return
         if not is_auto_start_schedule(original_embed):
             await self._send_notice(
                 ctx,
@@ -1926,6 +2062,20 @@ class PollCog(commands.Cog):
             return
 
         original_embed = poll_message.embeds[0]
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event while updating poll %s",
+                message_id,
+            )
+            lateness_event = None
+        if lateness_event is not None and lateness_event.activated_at is not None:
+            await self._send_notice(
+                ctx,
+                "❌ VCでの遅刻判定が始まった後は候補を更新できません",
+            )
+            return
         if is_schedule_closed(original_embed):
             await self._send_notice(
                 ctx,
@@ -1995,6 +2145,7 @@ class PollCog(commands.Cog):
                         "\n⚠️ 以前の開始通知を取消表示に更新できませんでした"
                     )
 
+        self._cancel_lateness_event(message_id)
         self._unregister_schedule_poll(message_id)
 
         try:
@@ -2125,6 +2276,25 @@ class PollCog(commands.Cog):
                 await self._send_notice(ctx, "❌ この開始時間投票は終了済みです")
             return
 
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event while deciding poll %s",
+                message_id,
+            )
+            lateness_event = None
+        if (
+            lateness_event is not None
+            and lateness_event.activated_at is not None
+            and lateness_event.start_time != decided_start_time
+        ):
+            await self._send_notice(
+                ctx,
+                "❌ VCでの遅刻判定が始まった後は別の開始時刻に変更できません",
+            )
+            return
+
         options = schedule_options_from_embed(original_embed)
         candidate_times = (
             [
@@ -2143,6 +2313,26 @@ class PollCog(commands.Cog):
                 f"（時刻候補: {candidates}）",
             )
             return
+
+        try:
+            voters_by_option = await self._collect_schedule_voters(
+                poll_message,
+                options or [],
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "failed to collect voters while deciding schedule poll %s",
+                message_id,
+            )
+            await self._send_notice(
+                ctx,
+                "❌ 参加予定者を取得できないため開始時間を確定できませんでした",
+            )
+            return
+        current_eligible_user_ids = eligible_voters_for_start(
+            voters_by_option,
+            decided_start_time,
+        )
 
         announcement = start_announcement(original_embed)
         already_notified = (
@@ -2274,6 +2464,15 @@ class PollCog(commands.Cog):
             await self._send_notice(ctx, "❌ 開始時間を確定できませんでした")
             return
 
+        await self._store_lateness_event(
+            poll_message,
+            guild_id=ctx.guild.id,
+            channel_id=ctx.channel.id,
+            start_time=decided_start_time,
+            current_eligible_user_ids=current_eligible_user_ids,
+            finalized=True,
+        )
+
         self._unregister_schedule_poll(message_id)
         await self._send_notice(
             ctx,
@@ -2285,6 +2484,63 @@ class PollCog(commands.Cog):
             ctx.author,
             message_id,
             decided_start_time,
+        )
+
+    @schedule.command(
+        name="lateoff",
+        description="この募集の遅刻記録・集計・通知を停止します",
+    )
+    @app_commands.describe(
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
+    )
+    @commands.guild_only()
+    async def schedule_lateoff(
+        self,
+        ctx: commands.Context,
+        message: Optional[str] = None,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            poll_message = await self._fetch_editable_schedule_poll(
+                ctx,
+                message_id,
+            )
+            if poll_message is None:
+                return
+            try:
+                changed = self._lateness_registry.disable_poll(
+                    poll_message_id=message_id,
+                    guild_id=ctx.guild.id,
+                    channel_id=ctx.channel.id,
+                    disabled_at=self._utc_now(),
+                )
+            except (sqlite3.Error, OSError):
+                logger.exception(
+                    "failed to disable lateness tracking for schedule poll %s",
+                    message_id,
+                )
+                await self._send_notice(ctx, "❌ 遅刻判定を停止できませんでした")
+                return
+            self._cancel_lateness_event(message_id)
+
+        if changed:
+            notice = (
+                "✅ この募集の遅刻判定を停止しました。"
+                "月次統計と今後の遅刻通知にも含めません"
+            )
+        else:
+            notice = "ℹ️ この募集の遅刻判定はすでに停止しています"
+        await self._send_notice(ctx, f"{notice}\n{poll_message.jump_url}")
+        logger.info(
+            "%s disabled lateness tracking for schedule poll %s",
+            ctx.author,
+            message_id,
         )
 
     @schedule.command(name="close", description="開始時間投票の自動判定を終了します")
@@ -2400,6 +2656,7 @@ class PollCog(commands.Cog):
                         "\n⚠️ 以前の開始通知を取消表示に更新できませんでした"
                     )
 
+        self._cancel_lateness_event(message_id)
         self._unregister_schedule_poll(message_id)
         return cancellation_warning
 
@@ -2790,9 +3047,643 @@ class PollCog(commands.Cog):
         if notification_id is not None:
             self._notification_poll_refs.pop(notification_id, None)
 
+    async def _store_lateness_event(
+        self,
+        poll_message: discord.Message,
+        *,
+        guild_id: int,
+        channel_id: int,
+        start_time: str,
+        current_eligible_user_ids: set[int] | None = None,
+        finalized: bool = False,
+        event_date: date | None = None,
+    ) -> ScheduleLatenessEvent | None:
+        try:
+            if self._lateness_registry.is_disabled(poll_message.id):
+                return None
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness setting for schedule poll %s",
+                poll_message.id,
+            )
+            return None
+        event_date = event_date or schedule_event_date(poll_message)
+        start_at = schedule_start_datetime(event_date, start_time)
+        minimum = schedule_minimum(poll_message.embeds[0]) or AUTO_START_THRESHOLD
+        now = self._utc_now()
+        if start_at + timedelta(hours=LATENESS_TRACKING_HOURS) < now:
+            self._cancel_lateness_event(poll_message.id)
+            return None
+        try:
+            event = self._lateness_registry.upsert_event(
+                poll_message_id=poll_message.id,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                event_date=event_date,
+                start_time=start_time,
+                minimum=minimum,
+                start_at=start_at,
+                finalized=finalized,
+            )
+            if event.snapshotted_at is None and now >= event.snapshot_at:
+                if current_eligible_user_ids is None:
+                    options = schedule_options_from_embed(poll_message.embeds[0])
+                    if options is None:
+                        return event
+                    voters_by_option = await self._collect_schedule_voters(
+                        poll_message,
+                        options,
+                    )
+                    current_eligible_user_ids = eligible_voters_for_start(
+                        voters_by_option,
+                        event.start_time,
+                    )
+                if self._lateness_registry.snapshot_participants(
+                    event.poll_message_id,
+                    current_eligible_user_ids,
+                    snapshotted_at=now,
+                ):
+                    event = self._lateness_registry.get_event(event.poll_message_id)
+                    if event is not None:
+                        self._capture_current_voice_presence(
+                            event,
+                            captured_at=now,
+                            unknown_join_at=event.start_at,
+                        )
+            elif (
+                event.snapshotted_at is not None
+                and current_eligible_user_ids is not None
+            ):
+                cancelled, restored = self._lateness_registry.sync_cancellations(
+                    event.poll_message_id,
+                    current_eligible_user_ids,
+                    changed_at=now,
+                )
+                for user_id in cancelled:
+                    self._lateness_registry.clear_presence(
+                        event.poll_message_id,
+                        user_id,
+                    )
+                self._capture_restored_voice_presence(
+                    event,
+                    restored,
+                    captured_at=now,
+                )
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to store lateness event for schedule poll %s",
+                poll_message.id,
+            )
+            return None
+
+        if event is not None and self._lateness_tracking_started:
+            self._queue_lateness_event_task(event)
+        return event
+
+    def _cancel_lateness_event(self, poll_message_id: int) -> bool:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        task = self._lateness_tasks.pop(poll_message_id, None)
+        if task is not None and task is not current_task:
+            task.cancel()
+        reaction_task = self._lateness_reaction_tasks.pop(
+            poll_message_id,
+            None,
+        )
+        if reaction_task is not None and reaction_task is not current_task:
+            reaction_task.cancel()
+        try:
+            return self._lateness_registry.cancel_pending(poll_message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to cancel lateness event for schedule poll %s",
+                poll_message_id,
+            )
+            return False
+
+    def _queue_lateness_event_task(self, event: ScheduleLatenessEvent) -> None:
+        if (
+            not self._lateness_tracking_started
+            or event.tracking_completed_at is not None
+        ):
+            return
+        previous_task = self._lateness_tasks.get(event.poll_message_id)
+        if previous_task is not None:
+            previous_task.cancel()
+        task = asyncio.create_task(
+            self._run_lateness_event_task(event.poll_message_id),
+            name=f"schedule-lateness-{event.poll_message_id}",
+        )
+        self._lateness_tasks[event.poll_message_id] = task
+        task.add_done_callback(
+            lambda completed, message_id=event.poll_message_id: (
+                self._lateness_tasks.pop(message_id, None)
+                if self._lateness_tasks.get(message_id) is completed
+                else None
+            )
+        )
+
+    async def _run_lateness_event_task(self, poll_message_id: int) -> None:
+        try:
+            wait_until_ready = getattr(self.bot, "wait_until_ready", None)
+            if wait_until_ready is not None:
+                await wait_until_ready()
+            event = self._lateness_registry.get_event(poll_message_id)
+            if (
+                event is None
+                or event.tracking_completed_at is not None
+                or self._lateness_registry.is_disabled(poll_message_id)
+            ):
+                return
+            if event.snapshotted_at is None:
+                await self._lateness_sleep(
+                    max(
+                        0.0,
+                        (event.snapshot_at - self._utc_now()).total_seconds(),
+                    )
+                )
+                lock = self._auto_start_locks.setdefault(
+                    poll_message_id,
+                    asyncio.Lock(),
+                )
+                async with lock:
+                    event = self._lateness_registry.get_event(poll_message_id)
+                    if event is None or event.snapshotted_at is not None:
+                        pass
+                    elif self._utc_now() <= event.tracking_until:
+                        poll_message = await self._fetch_lateness_poll(event)
+                        if poll_message is not None:
+                            await self._snapshot_lateness_event(
+                                event,
+                                poll_message,
+                            )
+
+            event = self._lateness_registry.get_event(poll_message_id)
+            if event is None or event.tracking_completed_at is not None:
+                return
+            await self._lateness_sleep(
+                max(0.0, (event.start_at - self._utc_now()).total_seconds())
+            )
+            lock = self._auto_start_locks.setdefault(
+                poll_message_id,
+                asyncio.Lock(),
+            )
+            async with lock:
+                event = self._lateness_registry.get_event(poll_message_id)
+                if (
+                    event is not None
+                    and event.snapshotted_at is not None
+                    and event.activated_at is None
+                    and event.tracking_completed_at is None
+                ):
+                    await self._evaluate_lateness_event(poll_message_id)
+
+            event = self._lateness_registry.get_event(poll_message_id)
+            if event is None or event.tracking_completed_at is not None:
+                return
+            await self._lateness_sleep(
+                max(
+                    0.0,
+                    (event.tracking_until - self._utc_now()).total_seconds(),
+                )
+            )
+            async with lock:
+                recorded_absences = self._lateness_registry.complete_tracking(
+                    poll_message_id,
+                    completed_at=self._utc_now(),
+                )
+                logger.info(
+                    "completed lateness tracking for schedule poll %s with %s absences",
+                    poll_message_id,
+                    recorded_absences,
+                )
+        except asyncio.CancelledError:
+            raise
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to run lateness event for schedule poll %s",
+                poll_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "unexpected failure in lateness event for schedule poll %s",
+                poll_message_id,
+            )
+
+    async def _fetch_lateness_poll(
+        self,
+        event: ScheduleLatenessEvent,
+    ) -> discord.Message | None:
+        get_channel = getattr(self.bot, "get_channel", None)
+        channel = get_channel(event.channel_id) if get_channel is not None else None
+        if channel is None:
+            fetch_channel = getattr(self.bot, "fetch_channel", None)
+            if fetch_channel is None:
+                return None
+            try:
+                channel = await fetch_channel(event.channel_id)
+            except discord.NotFound:
+                self._cancel_lateness_event(event.poll_message_id)
+                return None
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "failed to fetch channel for lateness event %s",
+                    event.poll_message_id,
+                )
+                return None
+        if not hasattr(channel, "fetch_message"):
+            self._cancel_lateness_event(event.poll_message_id)
+            return None
+        try:
+            poll_message = await channel.fetch_message(event.poll_message_id)
+        except discord.NotFound:
+            self._cancel_lateness_event(event.poll_message_id)
+            return None
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "failed to fetch poll for lateness event %s",
+                event.poll_message_id,
+            )
+            return None
+        if not poll_message.embeds:
+            self._cancel_lateness_event(event.poll_message_id)
+            return None
+        embed = poll_message.embeds[0]
+        tracked_start_time = (
+            schedule_decided_start_time(embed) or announced_start_time(embed)
+        )
+        if tracked_start_time != event.start_time:
+            self._cancel_lateness_event(event.poll_message_id)
+            return None
+        return poll_message
+
+    async def _snapshot_lateness_event(
+        self,
+        event: ScheduleLatenessEvent,
+        poll_message: discord.Message,
+    ) -> None:
+        options = schedule_options_from_embed(poll_message.embeds[0])
+        if options is None:
+            return
+        voters_by_option = await self._collect_schedule_voters(
+            poll_message,
+            options,
+        )
+        eligible_user_ids = eligible_voters_for_start(
+            voters_by_option,
+            event.start_time,
+        )
+        now = self._utc_now()
+        if not self._lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            eligible_user_ids,
+            snapshotted_at=now,
+        ):
+            return
+        refreshed_event = self._lateness_registry.get_event(event.poll_message_id)
+        if refreshed_event is None:
+            return
+        self._capture_current_voice_presence(
+            refreshed_event,
+            captured_at=now,
+            unknown_join_at=refreshed_event.start_at,
+        )
+        logger.info(
+            "snapshotted %s lateness participants for schedule poll %s",
+            len(eligible_user_ids),
+            event.poll_message_id,
+        )
+
+    def _get_lateness_guild(self, guild_id: int):
+        get_guild = getattr(self.bot, "get_guild", None)
+        return get_guild(guild_id) if get_guild is not None else None
+
+    def _capture_current_voice_presence(
+        self,
+        event: ScheduleLatenessEvent,
+        *,
+        captured_at: datetime,
+        unknown_join_at: datetime,
+    ) -> None:
+        guild = self._get_lateness_guild(event.guild_id)
+        if guild is None:
+            return
+        for participant in self._lateness_registry.participants(
+            event.poll_message_id
+        ):
+            member = guild.get_member(participant.user_id)
+            voice_channel = getattr(
+                getattr(member, "voice", None),
+                "channel",
+                None,
+            )
+            if voice_channel is None:
+                continue
+            joined_at = (
+                captured_at
+                if captured_at <= event.start_at
+                else unknown_join_at
+            )
+            self._lateness_registry.set_presence(
+                event.poll_message_id,
+                participant.user_id,
+                voice_channel_id=voice_channel.id,
+                joined_at=joined_at,
+            )
+
+    def _capture_restored_voice_presence(
+        self,
+        event: ScheduleLatenessEvent,
+        user_ids: set[int],
+        *,
+        captured_at: datetime,
+    ) -> None:
+        if not user_ids:
+            return
+        guild = self._get_lateness_guild(event.guild_id)
+        if guild is None:
+            return
+        for user_id in user_ids:
+            member = guild.get_member(user_id)
+            voice_channel = getattr(
+                getattr(member, "voice", None),
+                "channel",
+                None,
+            )
+            if voice_channel is None:
+                continue
+            if event.activated_at is not None:
+                if voice_channel.id == event.voice_channel_id:
+                    self._lateness_registry.record_arrival(
+                        event.poll_message_id,
+                        user_id,
+                        voice_channel_id=voice_channel.id,
+                        joined_at=captured_at,
+                    )
+            else:
+                self._lateness_registry.set_presence(
+                    event.poll_message_id,
+                    user_id,
+                    voice_channel_id=voice_channel.id,
+                    joined_at=captured_at,
+                )
+
+    def _queue_lateness_reaction_sync(
+        self,
+        payload,
+        *,
+        check_emoji: bool = True,
+    ) -> None:
+        if (
+            payload.guild_id is None
+            or (
+                check_emoji
+                and str(getattr(payload, "emoji", ""))
+                not in SCHEDULE_REACTION_EMOJIS
+            )
+        ):
+            return
+        bot_user = self.bot.user
+        if bot_user is not None and getattr(payload, "user_id", None) == bot_user.id:
+            return
+        try:
+            event = self._lateness_registry.get_event(payload.message_id)
+            disabled = self._lateness_registry.is_disabled(payload.message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception("failed to inspect lateness reaction event")
+            return
+        if event is None or event.snapshotted_at is None or disabled:
+            return
+        previous_task = self._lateness_reaction_tasks.get(payload.message_id)
+        if previous_task is not None:
+            previous_task.cancel()
+        task = asyncio.create_task(
+            self._run_lateness_reaction_sync(payload.message_id),
+            name=f"schedule-lateness-reaction-{payload.message_id}",
+        )
+        self._lateness_reaction_tasks[payload.message_id] = task
+        task.add_done_callback(
+            lambda completed, message_id=payload.message_id: (
+                self._lateness_reaction_tasks.pop(message_id, None)
+                if self._lateness_reaction_tasks.get(message_id) is completed
+                else None
+            )
+        )
+
+    async def _run_lateness_reaction_sync(self, poll_message_id: int) -> None:
+        try:
+            await self._lateness_reaction_sleep(
+                LATENESS_REACTION_GRACE_SECONDS
+            )
+            lock = self._auto_start_locks.setdefault(
+                poll_message_id,
+                asyncio.Lock(),
+            )
+            async with lock:
+                event = self._lateness_registry.get_event(poll_message_id)
+                if (
+                    event is None
+                    or event.snapshotted_at is None
+                    or self._lateness_registry.is_disabled(poll_message_id)
+                ):
+                    return
+                poll_message = await self._fetch_lateness_poll(event)
+                if poll_message is None:
+                    return
+                options = schedule_options_from_embed(poll_message.embeds[0])
+                if options is None:
+                    return
+                voters_by_option = await self._collect_schedule_voters(
+                    poll_message,
+                    options,
+                )
+                current_eligible_user_ids = eligible_voters_for_start(
+                    voters_by_option,
+                    event.start_time,
+                )
+                now = self._utc_now()
+                cancelled, restored = self._lateness_registry.sync_cancellations(
+                    poll_message_id,
+                    current_eligible_user_ids,
+                    changed_at=now,
+                )
+                for user_id in cancelled:
+                    self._lateness_registry.clear_presence(
+                        poll_message_id,
+                        user_id,
+                    )
+                refreshed_event = self._lateness_registry.get_event(
+                    poll_message_id
+                )
+                if refreshed_event is None:
+                    return
+                self._capture_restored_voice_presence(
+                    refreshed_event,
+                    restored,
+                    captured_at=now,
+                )
+                if now >= refreshed_event.start_at:
+                    await self._evaluate_lateness_event(poll_message_id)
+        except asyncio.CancelledError:
+            raise
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to sync lateness reactions for schedule poll %s",
+                poll_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "unexpected failure while syncing lateness reactions for poll %s",
+                poll_message_id,
+            )
+
+    async def _evaluate_lateness_event(self, poll_message_id: int) -> None:
+        event = self._lateness_registry.get_event(poll_message_id)
+        now = self._utc_now()
+        if (
+            event is None
+            or event.snapshotted_at is None
+            or event.activated_at is not None
+            or now < event.start_at
+            or now > event.tracking_until
+        ):
+            return
+        guild = self._get_lateness_guild(event.guild_id)
+        if guild is None:
+            return
+        members_by_channel: dict[int, list[int]] = {}
+        for participant in self._lateness_registry.participants(
+            event.poll_message_id
+        ):
+            member = guild.get_member(participant.user_id)
+            voice_channel = getattr(
+                getattr(member, "voice", None),
+                "channel",
+                None,
+            )
+            if voice_channel is None:
+                continue
+            members_by_channel.setdefault(voice_channel.id, []).append(
+                participant.user_id
+            )
+        candidates = [
+            (channel_id, user_ids)
+            for channel_id, user_ids in members_by_channel.items()
+            if len(user_ids) >= lateness_voice_quorum(event.minimum)
+        ]
+        if not candidates:
+            return
+        voice_channel_id, present_user_ids = min(
+            candidates,
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+        observed_presence = self._lateness_registry.presence(
+            event.poll_message_id
+        )
+        arrivals = {
+            user_id: (
+                observed_presence[user_id][1]
+                if user_id in observed_presence
+                and observed_presence[user_id][0] == voice_channel_id
+                else event.start_at
+            )
+            for user_id in present_user_ids
+        }
+        if self._lateness_registry.activate(
+            event.poll_message_id,
+            voice_channel_id=voice_channel_id,
+            activated_at=now,
+            arrivals=arrivals,
+        ):
+            logger.info(
+                "activated lateness tracking for schedule poll %s in VC %s with %s users",
+                event.poll_message_id,
+                voice_channel_id,
+                len(present_user_ids),
+            )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if member.bot or before.channel == after.channel:
+            return
+        now = self._utc_now()
+        try:
+            events = self._lateness_registry.tracking_events(
+                now=now,
+                guild_id=member.guild.id,
+            )
+        except (sqlite3.Error, OSError):
+            logger.exception("failed to load lateness events for voice update")
+            return
+        for event in events:
+            if now < event.snapshot_at:
+                continue
+            lock = self._auto_start_locks.setdefault(
+                event.poll_message_id,
+                asyncio.Lock(),
+            )
+            async with lock:
+                event = self._lateness_registry.get_event(event.poll_message_id)
+                if event is None:
+                    continue
+                if event.snapshotted_at is None:
+                    poll_message = await self._fetch_lateness_poll(event)
+                    if poll_message is None:
+                        continue
+                    await self._snapshot_lateness_event(event, poll_message)
+                    event = self._lateness_registry.get_event(
+                        event.poll_message_id
+                    )
+                    if event is None or event.snapshotted_at is None:
+                        continue
+                active_user_ids = {
+                    participant.user_id
+                    for participant in self._lateness_registry.participants(
+                        event.poll_message_id
+                    )
+                }
+                if member.id in active_user_ids:
+                    if event.activated_at is not None:
+                        if (
+                            after.channel is not None
+                            and after.channel.id == event.voice_channel_id
+                        ):
+                            late_seconds = self._lateness_registry.record_arrival(
+                                event.poll_message_id,
+                                member.id,
+                                voice_channel_id=after.channel.id,
+                                joined_at=now,
+                            )
+                            if late_seconds is not None and late_seconds > 0:
+                                logger.info(
+                                    "recorded %ss lateness for user %s in schedule poll %s",
+                                    late_seconds,
+                                    member.id,
+                                    event.poll_message_id,
+                                )
+                    else:
+                        if before.channel is not None:
+                            self._lateness_registry.clear_presence(
+                                event.poll_message_id,
+                                member.id,
+                                voice_channel_id=before.channel.id,
+                            )
+                        if after.channel is not None:
+                            self._lateness_registry.set_presence(
+                                event.poll_message_id,
+                                member.id,
+                                voice_channel_id=after.channel.id,
+                                joined_at=now,
+                            )
+                if event.activated_at is None and now >= event.start_at:
+                    await self._evaluate_lateness_event(event.poll_message_id)
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         self._queue_auto_start_check(payload)
+        self._queue_lateness_reaction_sync(payload)
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -2800,6 +3691,7 @@ class PollCog(commands.Cog):
             payload,
             cancelled_user_id=payload.user_id,
         )
+        self._queue_lateness_reaction_sync(payload)
 
     @commands.Cog.listener()
     async def on_raw_reaction_clear_emoji(
@@ -2814,6 +3706,7 @@ class PollCog(commands.Cog):
             check_emoji=False,
             cancelled_user_id=None,
         )
+        self._queue_lateness_reaction_sync(payload, check_emoji=False)
 
     @commands.Cog.listener()
     async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
@@ -2822,6 +3715,7 @@ class PollCog(commands.Cog):
             check_emoji=False,
             cancelled_user_id=None,
         )
+        self._queue_lateness_reaction_sync(payload, check_emoji=False)
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
@@ -2847,6 +3741,7 @@ class PollCog(commands.Cog):
         message_id: int,
         channel_id: int,
     ) -> None:
+        self._cancel_lateness_event(message_id)
         poll = self._notification_poll_refs.pop(message_id, None)
         if poll is not None:
             self._poll_notification_ids.pop(poll.message_id, None)
@@ -3138,6 +4033,16 @@ class PollCog(commands.Cog):
         )
         if self._auto_start_revisions.get(message_id) != revision:
             return
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event for schedule poll %s",
+                message_id,
+            )
+            lateness_event = None
+        if lateness_event is not None and lateness_event.activated_at is not None:
+            return
 
         start_time = choose_start_time(voters_by_option, minimum)
         announcement = start_announcement(poll_message.embeds[0])
@@ -3146,6 +4051,19 @@ class PollCog(commands.Cog):
         )
         missing_current_notification = False
         if current_start_time == start_time:
+            if start_time is None:
+                self._cancel_lateness_event(message_id)
+            else:
+                await self._store_lateness_event(
+                    poll_message,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    start_time=start_time,
+                    current_eligible_user_ids=eligible_voters_for_start(
+                        voters_by_option,
+                        start_time,
+                    ),
+                )
             if announcement is None or announcement.message_id is None:
                 return
             existing_notification = await self._fetch_start_notification(
@@ -3179,6 +4097,13 @@ class PollCog(commands.Cog):
                 role=role,
                 new_start_time=start_time,
                 minimum=minimum,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                current_eligible_user_ids=(
+                    eligible_voters_for_start(voters_by_option, start_time)
+                    if start_time is not None
+                    else None
+                ),
                 missing_current_notification=missing_current_notification,
                 cancelled_user_id=cancelled_user_id,
             ),
@@ -3206,6 +4131,9 @@ class PollCog(commands.Cog):
         role: discord.Role | None,
         new_start_time: str | None,
         minimum: int,
+        guild_id: int | None = None,
+        channel_id: int | None = None,
+        current_eligible_user_ids: set[int] | None = None,
         missing_current_notification: bool = False,
         cancelled_user_id: int | None = None,
     ) -> None:
@@ -3322,6 +4250,7 @@ class PollCog(commands.Cog):
                         role_mention,
                     )
                     return
+            self._cancel_lateness_event(poll_message.id)
             logger.info("cancelled start announcement for schedule poll %s", poll_message.id)
             return
 
@@ -3463,6 +4392,15 @@ class PollCog(commands.Cog):
                         poll_message.id,
                     )
             raise
+
+        if guild_id is not None and channel_id is not None:
+            await self._store_lateness_event(
+                poll_message,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                start_time=new_start_time,
+                current_eligible_user_ids=current_eligible_user_ids,
+            )
 
         logger.info(
             "schedule poll %s reached %s unique voters; announced %s",
@@ -3625,7 +4563,8 @@ class PollCog(commands.Cog):
         options: list[str],
     ) -> dict[str, set[int]]:
         reactions_by_emoji = {
-            str(reaction.emoji): reaction for reaction in poll_message.reactions
+            str(reaction.emoji): reaction
+            for reaction in getattr(poll_message, "reactions", ())
         }
         voters_by_option: dict[str, set[int]] = {}
         for option, emoji in zip(options, schedule_option_emojis(options)):
@@ -3767,6 +4706,19 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule decide [投稿IDまたはリンク] <候補の時刻>`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_lateoff.error
+    async def schedule_lateoff_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule lateoff [投稿IDまたはリンク]`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):

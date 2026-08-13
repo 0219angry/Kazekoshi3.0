@@ -638,6 +638,7 @@ class ScheduleDisplayTests(unittest.TestCase):
                 "deadline",
                 "update",
                 "decide",
+                "lateoff",
                 "close",
             ],
         )
@@ -654,6 +655,7 @@ class ScheduleDisplayTests(unittest.TestCase):
             "deadline",
             "update",
             "decide",
+            "lateoff",
             "close",
         ):
             command = next(
@@ -795,6 +797,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                     "deadline",
                     "update",
                     "decide",
+                    "lateoff",
                     "close",
                 ],
             )
