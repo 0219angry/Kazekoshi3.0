@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from kazekoshi.schedule_lateness import (
+    LATENESS_REMINDER_MINUTES,
     LATENESS_TRACKING_HOURS,
     MonthlyLatenessStat,
     ScheduleLatenessEvent,
@@ -82,6 +83,7 @@ SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
 LATEST_SCHEDULE_HISTORY_LIMIT = 100
 LATENESS_REACTION_GRACE_SECONDS = 2
+LATENESS_REMINDER_MAX_MENTIONS = 80
 LATENESS_YEAR_MONTH_PATTERN = re.compile(
     r"(?P<year>[0-9]{4})[-/]?(?P<month>[0-9]{2})"
 )
@@ -626,6 +628,14 @@ def format_lateness_duration(seconds: float) -> str:
     if remaining_seconds and not hours:
         parts.append(f"{remaining_seconds}秒")
     return "".join(parts) or "0秒"
+
+
+def format_lateness_reminder_duration(minutes: int) -> str:
+    if minutes <= 0:
+        raise ValueError("reminder minutes must be positive")
+    if minutes % 60 == 0:
+        return f"{minutes // 60}時間"
+    return f"{minutes}分"
 
 
 def build_lateness_stats_embeds(
@@ -3661,6 +3671,53 @@ class PollCog(commands.Cog):
             event = self._lateness_registry.get_event(poll_message_id)
             if event is None or event.tracking_completed_at is not None:
                 return
+            if (
+                event.activated_at is not None
+                and self._complete_lateness_if_minimum_present(
+                    event,
+                    completed_at=self._utc_now(),
+                )
+            ):
+                return
+            for reminder_minutes in LATENESS_REMINDER_MINUTES:
+                reminder_at = event.start_at + timedelta(
+                    minutes=reminder_minutes
+                )
+                if reminder_at >= event.tracking_until:
+                    continue
+                await self._lateness_sleep(
+                    max(
+                        0.0,
+                        (reminder_at - self._utc_now()).total_seconds(),
+                    )
+                )
+                async with lock:
+                    event = self._lateness_registry.get_event(poll_message_id)
+                    if (
+                        event is None
+                        or event.tracking_completed_at is not None
+                        or self._lateness_registry.is_disabled(poll_message_id)
+                    ):
+                        return
+                    if event.activated_at is None:
+                        await self._evaluate_lateness_event(poll_message_id)
+                        event = self._lateness_registry.get_event(
+                            poll_message_id
+                        )
+                    if event is not None and event.activated_at is not None:
+                        await self._process_due_lateness_reminders(event)
+                        event = self._lateness_registry.get_event(
+                            poll_message_id
+                        )
+                        if (
+                            event is None
+                            or event.tracking_completed_at is not None
+                        ):
+                            return
+
+            event = self._lateness_registry.get_event(poll_message_id)
+            if event is None or event.tracking_completed_at is not None:
+                return
             await self._lateness_sleep(
                 max(
                     0.0,
@@ -3689,6 +3746,191 @@ class PollCog(commands.Cog):
                 "unexpected failure in lateness event for schedule poll %s",
                 poll_message_id,
             )
+
+    async def _fetch_lateness_notification_channel(
+        self,
+        event: ScheduleLatenessEvent,
+    ):
+        get_channel = getattr(self.bot, "get_channel", None)
+        channel = get_channel(event.channel_id) if get_channel is not None else None
+        if channel is None:
+            fetch_channel = getattr(self.bot, "fetch_channel", None)
+            if fetch_channel is None:
+                return None
+            try:
+                channel = await fetch_channel(event.channel_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                logger.exception(
+                    "failed to fetch channel for lateness reminder %s",
+                    event.poll_message_id,
+                )
+                return None
+        if not hasattr(channel, "send"):
+            return None
+        return channel
+
+    def _capture_current_activated_arrivals(
+        self,
+        event: ScheduleLatenessEvent,
+    ) -> None:
+        """再起動などで取り逃した、開催VCにいるメンバーを到着済みにする。"""
+        if event.activated_at is None or event.voice_channel_id is None:
+            return
+        guild = self._get_lateness_guild(event.guild_id)
+        if guild is None:
+            return
+        for user_id in self._lateness_registry.unarrived_participant_user_ids(
+            event.poll_message_id
+        ):
+            member = guild.get_member(user_id)
+            voice_channel = getattr(
+                getattr(member, "voice", None),
+                "channel",
+                None,
+            )
+            if (
+                voice_channel is None
+                or voice_channel.id != event.voice_channel_id
+            ):
+                continue
+            self._lateness_registry.record_arrival(
+                event.poll_message_id,
+                user_id,
+                voice_channel_id=voice_channel.id,
+                # 入室時刻を復元できない場合は、誤遅刻を避ける。
+                joined_at=event.start_at,
+            )
+
+    def _complete_lateness_if_minimum_present(
+        self,
+        event: ScheduleLatenessEvent,
+        *,
+        completed_at: datetime,
+    ) -> bool:
+        if event.activated_at is None or event.voice_channel_id is None:
+            return False
+        self._capture_current_activated_arrivals(event)
+        guild = self._get_lateness_guild(event.guild_id)
+        if guild is None:
+            return False
+        present_count = 0
+        for participant in self._lateness_registry.participants(
+            event.poll_message_id
+        ):
+            member = guild.get_member(participant.user_id)
+            voice_channel = getattr(
+                getattr(member, "voice", None),
+                "channel",
+                None,
+            )
+            if (
+                voice_channel is not None
+                and voice_channel.id == event.voice_channel_id
+            ):
+                present_count += 1
+        if present_count < event.minimum:
+            return False
+        if not self._lateness_registry.complete_tracking_without_absences(
+            event.poll_message_id,
+            completed_at=completed_at,
+        ):
+            return False
+        self._stop_lateness_tasks(event.poll_message_id)
+        logger.info(
+            "completed lateness tracking for schedule poll %s with %s/%s present",
+            event.poll_message_id,
+            present_count,
+            event.minimum,
+        )
+        return True
+
+    async def _process_due_lateness_reminders(
+        self,
+        event: ScheduleLatenessEvent,
+    ) -> bool:
+        now = self._utc_now()
+        if (
+            event.activated_at is None
+            or event.tracking_completed_at is not None
+            or now >= event.tracking_until
+            or self._lateness_registry.is_disabled(event.poll_message_id)
+        ):
+            return False
+        history = self._lateness_registry.reminder_history(
+            event.poll_message_id
+        )
+        pending_thresholds = {
+            threshold
+            for threshold in LATENESS_REMINDER_MINUTES
+            if threshold not in history
+            and now >= event.start_at + timedelta(minutes=threshold)
+        }
+        if not pending_thresholds:
+            return False
+
+        reminder_minutes = max(pending_thresholds)
+        if self._complete_lateness_if_minimum_present(
+            event,
+            completed_at=now,
+        ):
+            return False
+        late_user_ids = (
+            self._lateness_registry.unarrived_participant_user_ids(
+                event.poll_message_id
+            )
+        )
+        if not late_user_ids:
+            self._lateness_registry.record_processed_reminders(
+                event.poll_message_id,
+                pending_thresholds,
+                processed_at=now,
+            )
+            return False
+
+        channel = await self._fetch_lateness_notification_channel(event)
+        if channel is None:
+            return False
+        duration = format_lateness_reminder_duration(reminder_minutes)
+        try:
+            for offset in range(
+                0,
+                len(late_user_ids),
+                LATENESS_REMINDER_MAX_MENTIONS,
+            ):
+                user_ids = late_user_ids[
+                    offset:offset + LATENESS_REMINDER_MAX_MENTIONS
+                ]
+                mentions = " ".join(f"<@{user_id}>" for user_id in user_ids)
+                await channel.send(
+                    content=f"{mentions} {duration}遅刻",
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        users=[discord.Object(id=user_id) for user_id in user_ids],
+                        roles=False,
+                        replied_user=False,
+                    ),
+                )
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.exception(
+                "failed to send %s-minute lateness reminder for poll %s",
+                reminder_minutes,
+                event.poll_message_id,
+            )
+            return False
+
+        self._lateness_registry.record_processed_reminders(
+            event.poll_message_id,
+            pending_thresholds,
+            processed_at=now,
+            notified_threshold=reminder_minutes,
+        )
+        logger.info(
+            "sent %s-minute lateness reminder for poll %s to %s users",
+            reminder_minutes,
+            event.poll_message_id,
+            len(late_user_ids),
+        )
+        return True
 
     async def _fetch_lateness_poll(
         self,
@@ -3942,6 +4184,14 @@ class PollCog(commands.Cog):
                     restored,
                     captured_at=now,
                 )
+                if (
+                    refreshed_event.activated_at is not None
+                    and self._complete_lateness_if_minimum_present(
+                        refreshed_event,
+                        completed_at=now,
+                    )
+                ):
+                    return
                 if now >= refreshed_event.start_at:
                     await self._evaluate_lateness_event(poll_message_id)
         except asyncio.CancelledError:
@@ -4021,6 +4271,15 @@ class PollCog(commands.Cog):
                 voice_channel_id,
                 len(present_user_ids),
             )
+            activated_event = self._lateness_registry.get_event(
+                event.poll_message_id
+            )
+            if activated_event is not None:
+                if not self._complete_lateness_if_minimum_present(
+                    activated_event,
+                    completed_at=now,
+                ):
+                    await self._process_due_lateness_reminders(activated_event)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
@@ -4081,6 +4340,10 @@ class PollCog(commands.Cog):
                                     member.id,
                                     event.poll_message_id,
                                 )
+                            self._complete_lateness_if_minimum_present(
+                                event,
+                                completed_at=now,
+                            )
                     else:
                         if before.channel is not None:
                             self._lateness_registry.clear_presence(

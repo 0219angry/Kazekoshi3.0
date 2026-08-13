@@ -12,6 +12,7 @@ from kazekoshi.cogs.poll import (
     build_schedule_embed,
     eligible_voters_for_start,
     format_lateness_duration,
+    format_lateness_reminder_duration,
     mark_start_time_announced,
     parse_lateness_period,
     schedule_option_emojis,
@@ -20,6 +21,7 @@ from kazekoshi.cogs.poll import (
 )
 from kazekoshi.schedule_lateness import (
     LATENESS_MAX_SECONDS,
+    LATENESS_REMINDER_MINUTES,
     MonthlyLatenessStat,
     ScheduleLatenessRegistry,
     lateness_voice_quorum,
@@ -42,12 +44,28 @@ class FakeReaction:
         return iterator()
 
 
+class AdvancingSleeper:
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+
+    async def __call__(self, delay):
+        self.calls.append(delay)
+        self.clock["now"] += timedelta(seconds=delay)
+
+
 class ScheduleLatenessLogicTests(unittest.TestCase):
     def test_voice_quorum_is_two_below_minimum_with_floor_of_one(self):
         self.assertEqual(lateness_voice_quorum(5), 3)
         self.assertEqual(lateness_voice_quorum(4), 2)
         self.assertEqual(lateness_voice_quorum(3), 1)
         self.assertEqual(lateness_voice_quorum(1), 1)
+
+    def test_lateness_reminder_thresholds_and_labels(self):
+        self.assertEqual(LATENESS_REMINDER_MINUTES, (15, 30, 60, 120))
+        self.assertEqual(format_lateness_reminder_duration(15), "15分")
+        self.assertEqual(format_lateness_reminder_duration(60), "1時間")
+        self.assertEqual(format_lateness_reminder_duration(120), "2時間")
 
     def test_start_datetime_handles_jst_and_24_hour_notation(self):
         self.assertEqual(
@@ -389,6 +407,51 @@ class ScheduleLatenessRegistryTests(unittest.TestCase):
             self.registry.get_event(event.poll_message_id).tracking_completed_at
         )
 
+    def test_normal_completion_does_not_record_unarrived_users_as_absent(self):
+        event = self.create_event()
+        self.registry.snapshot_participants(
+            event.poll_message_id,
+            {2, 3, 4, 5, 6},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=3),
+            arrivals={
+                2: START_AT + timedelta(minutes=1),
+                3: START_AT + timedelta(minutes=2),
+                4: START_AT + timedelta(minutes=3),
+                5: START_AT + timedelta(minutes=4),
+            },
+        )
+
+        self.assertTrue(
+            self.registry.complete_tracking_without_absences(
+                event.poll_message_id,
+                completed_at=START_AT + timedelta(minutes=5),
+            )
+        )
+
+        self.assertIsNotNone(
+            self.registry.get_event(event.poll_message_id).tracking_completed_at
+        )
+        self.assertNotIn(
+            6,
+            {
+                attendance.user_id
+                for attendance in self.registry.attendance(
+                    event.poll_message_id
+                )
+            },
+        )
+        self.assertFalse(
+            self.registry.complete_tracking_without_absences(
+                event.poll_message_id,
+                completed_at=START_AT + timedelta(minutes=6),
+            )
+        )
+
     def test_disabled_poll_is_not_tracked_or_included_in_monthly_stats(self):
         event = self.create_event()
         self.registry.snapshot_participants(
@@ -438,6 +501,33 @@ class ScheduleLatenessRegistryTests(unittest.TestCase):
             0,
         )
 
+    def test_reminder_history_tracks_processed_and_notified_thresholds(self):
+        event = self.create_event()
+        self.assertEqual(self.registry.reminder_history(event.poll_message_id), {})
+
+        self.assertEqual(
+            self.registry.record_processed_reminders(
+                event.poll_message_id,
+                {15, 30, 60},
+                processed_at=START_AT + timedelta(minutes=65),
+                notified_threshold=60,
+            ),
+            3,
+        )
+        self.assertEqual(
+            self.registry.reminder_history(event.poll_message_id),
+            {15: False, 30: False, 60: True},
+        )
+        self.assertEqual(
+            self.registry.record_processed_reminders(
+                event.poll_message_id,
+                {60},
+                processed_at=START_AT + timedelta(minutes=66),
+                notified_threshold=60,
+            ),
+            0,
+        )
+
     def test_delete_poll_purges_event_attendance_and_disabled_marker(self):
         event = self.create_event()
         self.registry.snapshot_participants(
@@ -463,12 +553,19 @@ class ScheduleLatenessRegistryTests(unittest.TestCase):
             channel_id=10,
             disabled_at=START_AT + timedelta(minutes=2),
         )
+        self.registry.record_processed_reminders(
+            event.poll_message_id,
+            {15},
+            processed_at=START_AT + timedelta(minutes=15),
+            notified_threshold=15,
+        )
 
         self.assertTrue(self.registry.delete_poll(event.poll_message_id))
 
         self.assertIsNone(self.registry.get_event(event.poll_message_id))
         self.assertEqual(self.registry.participants(event.poll_message_id), [])
         self.assertEqual(self.registry.attendance(event.poll_message_id), [])
+        self.assertEqual(self.registry.reminder_history(event.poll_message_id), {})
         self.assertFalse(self.registry.is_disabled(event.poll_message_id))
         self.assertFalse(self.registry.delete_poll(event.poll_message_id))
 
@@ -496,7 +593,7 @@ class ScheduleLatenessVoiceTests(unittest.IsolatedAsyncioTestCase):
         )
         for member in self.members.values():
             member.guild = self.guild
-        self.channel = SimpleNamespace(id=10)
+        self.channel = SimpleNamespace(id=10, send=AsyncMock())
         self.bot = SimpleNamespace(
             user=self.bot_user,
             get_guild=lambda guild_id: self.guild if guild_id == 1 else None,
@@ -769,6 +866,270 @@ class ScheduleLatenessVoiceTests(unittest.IsolatedAsyncioTestCase):
                 month=date(2026, 8, 1),
             ),
             [],
+        )
+
+    async def test_tracking_task_sends_four_persisted_lateness_reminders(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=5,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2, 3, 4, 5, 6},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.lateness_registry.sync_cancellations(
+            event.poll_message_id,
+            {2, 3, 4, 5},
+            changed_at=START_AT - timedelta(minutes=5),
+        )
+        self.lateness_registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=3),
+            arrivals={
+                2: START_AT + timedelta(minutes=1),
+                3: START_AT + timedelta(minutes=2),
+                4: START_AT + timedelta(minutes=3),
+            },
+        )
+        self.set_now(START_AT + timedelta(minutes=3))
+        sleeper = AdvancingSleeper(self.clock)
+        cog = PollCog(
+            self.bot,
+            registry=self.schedule_registry,
+            lateness_registry=self.lateness_registry,
+            lateness_sleeper=sleeper,
+            now_provider=lambda: self.clock["now"],
+        )
+
+        await cog._run_lateness_event_task(event.poll_message_id)
+
+        contents = [
+            call.kwargs["content"]
+            for call in self.channel.send.await_args_list
+        ]
+        self.assertEqual(
+            contents,
+            [
+                "<@5> 15分遅刻",
+                "<@5> 30分遅刻",
+                "<@5> 1時間遅刻",
+                "<@5> 2時間遅刻",
+            ],
+        )
+        for call in self.channel.send.await_args_list:
+            self.assertEqual(
+                [user.id for user in call.kwargs["allowed_mentions"].users],
+                [5],
+            )
+        self.assertEqual(
+            self.lateness_registry.reminder_history(event.poll_message_id),
+            {15: True, 30: True, 60: True, 120: True},
+        )
+        self.assertIsNotNone(
+            self.lateness_registry.get_event(
+                event.poll_message_id
+            ).tracking_completed_at
+        )
+
+    async def test_late_activation_sends_only_latest_due_reminder_once(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=5,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2, 3, 4, 5},
+            snapshotted_at=event.snapshot_at,
+        )
+        voice_channel = SimpleNamespace(id=20)
+        for user_id in (2, 3, 4):
+            self.members[user_id].voice = SimpleNamespace(channel=voice_channel)
+        self.set_now(START_AT + timedelta(minutes=65))
+
+        await self.cog._evaluate_lateness_event(event.poll_message_id)
+
+        self.channel.send.assert_awaited_once()
+        self.assertEqual(
+            self.channel.send.await_args.kwargs["content"],
+            "<@5> 1時間遅刻",
+        )
+        self.assertEqual(
+            self.lateness_registry.reminder_history(event.poll_message_id),
+            {15: False, 30: False, 60: True},
+        )
+
+        restarted_cog = PollCog(
+            self.bot,
+            registry=self.schedule_registry,
+            lateness_registry=self.lateness_registry,
+            now_provider=lambda: self.clock["now"],
+        )
+        await restarted_cog._process_due_lateness_reminders(
+            self.lateness_registry.get_event(event.poll_message_id)
+        )
+        self.channel.send.assert_awaited_once()
+
+    async def test_cancelled_and_arrived_users_stop_receiving_reminders(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=5,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2, 3, 4, 5, 6},
+            snapshotted_at=event.snapshot_at,
+        )
+        self.lateness_registry.sync_cancellations(
+            event.poll_message_id,
+            {2, 3, 4, 5},
+            changed_at=START_AT - timedelta(minutes=5),
+        )
+        self.lateness_registry.activate(
+            event.poll_message_id,
+            voice_channel_id=20,
+            activated_at=START_AT + timedelta(minutes=3),
+            arrivals={
+                2: START_AT + timedelta(minutes=1),
+                3: START_AT + timedelta(minutes=2),
+                4: START_AT + timedelta(minutes=3),
+            },
+        )
+        self.set_now(START_AT + timedelta(minutes=15))
+
+        await self.cog._process_due_lateness_reminders(
+            self.lateness_registry.get_event(event.poll_message_id)
+        )
+
+        self.assertEqual(
+            self.channel.send.await_args.kwargs["content"],
+            "<@5> 15分遅刻",
+        )
+        await self.join_voice(
+            5,
+            SimpleNamespace(id=20),
+            at=START_AT + timedelta(minutes=20),
+        )
+        self.set_now(START_AT + timedelta(minutes=30))
+        await self.cog._process_due_lateness_reminders(
+            self.lateness_registry.get_event(event.poll_message_id)
+        )
+
+        self.channel.send.assert_awaited_once()
+        self.assertEqual(
+            self.lateness_registry.reminder_history(event.poll_message_id),
+            {15: True, 30: False},
+        )
+
+    async def test_minimum_present_ends_reminders_without_absence_record(self):
+        event = self.lateness_registry.upsert_event(
+            poll_message_id=100,
+            guild_id=1,
+            channel_id=10,
+            event_date=date(2026, 8, 14),
+            start_time="21:00",
+            minimum=5,
+            start_at=START_AT,
+            finalized=True,
+        )
+        self.lateness_registry.snapshot_participants(
+            event.poll_message_id,
+            {2, 3, 4, 5, 6, 7},
+            snapshotted_at=event.snapshot_at,
+        )
+        voice_channel = SimpleNamespace(id=20)
+        await self.join_voice(
+            2,
+            voice_channel,
+            at=START_AT + timedelta(minutes=1),
+        )
+        await self.join_voice(
+            3,
+            voice_channel,
+            at=START_AT + timedelta(minutes=2),
+        )
+        await self.join_voice(
+            4,
+            voice_channel,
+            at=START_AT + timedelta(minutes=3),
+        )
+        await self.join_voice(
+            2,
+            None,
+            at=START_AT + timedelta(minutes=4),
+        )
+        self.set_now(START_AT + timedelta(minutes=15))
+        await self.cog._process_due_lateness_reminders(
+            self.lateness_registry.get_event(event.poll_message_id)
+        )
+        self.assertEqual(
+            self.channel.send.await_args.kwargs["content"],
+            "<@5> <@6> <@7> 15分遅刻",
+        )
+
+        await self.join_voice(
+            5,
+            voice_channel,
+            at=START_AT + timedelta(minutes=20),
+        )
+        self.assertIsNone(
+            self.lateness_registry.get_event(event.poll_message_id).tracking_completed_at
+        )
+        await self.join_voice(
+            6,
+            voice_channel,
+            at=START_AT + timedelta(minutes=25),
+        )
+        self.assertIsNone(
+            self.lateness_registry.get_event(event.poll_message_id).tracking_completed_at
+        )
+        await self.join_voice(
+            2,
+            voice_channel,
+            at=START_AT + timedelta(minutes=26),
+        )
+
+        completed = self.lateness_registry.get_event(event.poll_message_id)
+        self.assertIsNotNone(completed.tracking_completed_at)
+        self.set_now(START_AT + timedelta(minutes=30))
+        self.assertFalse(
+            await self.cog._process_due_lateness_reminders(completed)
+        )
+        self.channel.send.assert_awaited_once()
+        self.assertNotIn(
+            7,
+            {
+                attendance.user_id
+                for attendance in self.lateness_registry.attendance(
+                    event.poll_message_id
+                )
+            },
+        )
+        self.assertEqual(
+            self.lateness_registry.complete_tracking(
+                event.poll_message_id,
+                completed_at=START_AT + timedelta(hours=3),
+            ),
+            0,
         )
 
     async def test_tracking_task_finalizes_absence_after_three_hours(self):

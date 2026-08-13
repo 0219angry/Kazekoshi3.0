@@ -8,6 +8,7 @@ from pathlib import Path
 LATENESS_SNAPSHOT_MINUTES = 15
 LATENESS_TRACKING_HOURS = 3
 LATENESS_MAX_SECONDS = LATENESS_TRACKING_HOURS * 60 * 60
+LATENESS_REMINDER_MINUTES = (15, 30, 60, 120)
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,17 @@ class ScheduleLatenessRegistry:
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
                 disabled_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS schedule_lateness_reminders (
+                poll_message_id INTEGER NOT NULL,
+                threshold_minutes INTEGER NOT NULL,
+                processed_at REAL NOT NULL,
+                notified INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (poll_message_id, threshold_minutes),
+                FOREIGN KEY (poll_message_id)
+                    REFERENCES schedule_lateness_events (poll_message_id)
+                    ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS schedule_lateness_events_guild_time
@@ -470,6 +482,86 @@ class ScheduleLatenessRegistry:
             for row in rows
         ]
 
+    def unarrived_participant_user_ids(
+        self,
+        poll_message_id: int,
+    ) -> list[int]:
+        """開催VCへ一度も入っていない、未キャンセルの固定メンバーを返す。"""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT participant.user_id
+                FROM schedule_lateness_participants AS participant
+                JOIN schedule_lateness_events AS event
+                  ON event.poll_message_id = participant.poll_message_id
+                LEFT JOIN schedule_lateness_attendance AS attendance
+                  ON attendance.poll_message_id = participant.poll_message_id
+                 AND attendance.user_id = participant.user_id
+                WHERE participant.poll_message_id = ?
+                  AND participant.cancelled_at IS NULL
+                  AND attendance.user_id IS NULL
+                  AND event.activated_at IS NOT NULL
+                  AND event.tracking_completed_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM schedule_lateness_disabled AS disabled
+                      WHERE disabled.poll_message_id = event.poll_message_id
+                  )
+                ORDER BY participant.user_id
+                """,
+                (poll_message_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def reminder_history(self, poll_message_id: int) -> dict[int, bool]:
+        """処理済みの節目と、実際に通知したかどうかを返す。"""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT threshold_minutes, notified
+                FROM schedule_lateness_reminders
+                WHERE poll_message_id = ?
+                ORDER BY threshold_minutes
+                """,
+                (poll_message_id,),
+            ).fetchall()
+        return {row[0]: bool(row[1]) for row in rows}
+
+    def record_processed_reminders(
+        self,
+        poll_message_id: int,
+        thresholds: set[int],
+        *,
+        processed_at: datetime,
+        notified_threshold: int | None = None,
+    ) -> int:
+        """期限到達済みの節目を記録し、再起動後の重複通知を防ぐ。"""
+        if notified_threshold is not None and notified_threshold not in thresholds:
+            raise ValueError("notified threshold must be processed")
+        if any(threshold <= 0 for threshold in thresholds):
+            raise ValueError("reminder thresholds must be positive")
+        processed_timestamp = _as_utc(processed_at).timestamp()
+        inserted = 0
+        with closing(self._connect()) as connection:
+            with connection:
+                for threshold in sorted(thresholds):
+                    cursor = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO schedule_lateness_reminders (
+                            poll_message_id, threshold_minutes,
+                            processed_at, notified
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            poll_message_id,
+                            threshold,
+                            processed_timestamp,
+                            int(threshold == notified_threshold),
+                        ),
+                    )
+                    inserted += cursor.rowcount
+        return inserted
+
     def sync_cancellations(
         self,
         poll_message_id: int,
@@ -765,6 +857,41 @@ class ScheduleLatenessRegistry:
                     ),
                 )
         return late_seconds if cursor.rowcount > 0 else None
+
+    def complete_tracking_without_absences(
+        self,
+        poll_message_id: int,
+        *,
+        completed_at: datetime,
+    ) -> bool:
+        """最低人数がVCにそろった追跡を、欠席記録なしで正常終了する。"""
+        completed_timestamp = _as_utc(completed_at).timestamp()
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE schedule_lateness_events
+                    SET tracking_completed_at = ?
+                    WHERE poll_message_id = ?
+                      AND activated_at IS NOT NULL
+                      AND tracking_completed_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM schedule_lateness_disabled AS disabled
+                          WHERE disabled.poll_message_id =
+                                schedule_lateness_events.poll_message_id
+                      )
+                    """,
+                    (completed_timestamp, poll_message_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM schedule_lateness_presence
+                    WHERE poll_message_id = ?
+                    """,
+                    (poll_message_id,),
+                )
+        return cursor.rowcount > 0
 
     def complete_tracking(
         self,
