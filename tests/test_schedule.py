@@ -646,6 +646,27 @@ class ScheduleDisplayTests(unittest.TestCase):
             parameter for parameter in add_command.parameters if parameter.name == "options"
         )
         self.assertFalse(options_parameter.required)
+        for command_name in (
+            "status",
+            "clone",
+            "date",
+            "minimum",
+            "deadline",
+            "update",
+            "decide",
+            "close",
+        ):
+            command = next(
+                command
+                for command in application_commands
+                if command.name == command_name
+            )
+            message_parameter = next(
+                parameter
+                for parameter in command.parameters
+                if parameter.name == "message"
+            )
+            self.assertFalse(message_parameter.required, command_name)
 
 
 class SchedulePollRegistryTests(unittest.TestCase):
@@ -928,6 +949,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         bot = SimpleNamespace(user=bot_user)
         cog = PollCog(bot, registry=self.registry)
+        cog._resolve_schedule_message_id = AsyncMock(return_value=99)
         cog._queue_auto_start_check_by_id = Mock()
         ctx = SimpleNamespace(
             bot=bot,
@@ -939,8 +961,9 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             send=AsyncMock(return_value=cloned_message),
         )
 
-        await PollCog.schedule_clone.callback(cog, ctx, "99")
+        await PollCog.schedule_clone.callback(cog, ctx)
 
+        cog._resolve_schedule_message_id.assert_awaited_once_with(ctx, None)
         sent = ctx.send.await_args.kwargs
         cloned_embed = sent["embed"]
         self.assertEqual(sent["content"], role.mention)
@@ -1308,6 +1331,98 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1️⃣20:00: 1票", sent.kwargs["embed"].description)
         poll_message.edit.assert_not_awaited()
 
+    async def test_omitted_message_uses_latest_poll_for_status_and_close(self):
+        bot_user = SimpleNamespace(id=1, bot=True)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        role = SimpleNamespace(name="RAID")
+        poll_message = SimpleNamespace(
+            id=100,
+            created_at=FIXED_NOW,
+            author=bot_user,
+            embeds=[
+                build_schedule_embed(
+                    role,
+                    ["20:00", "21:00", "NG"],
+                    creator,
+                    auto_start=True,
+                )
+            ],
+            reactions=[],
+            role_mentions=[],
+            content="<@&88>",
+            jump_url="https://discord.com/channels/1/10/100",
+            edit=AsyncMock(),
+        )
+
+        async def save_poll_edit(*, embed):
+            poll_message.embeds = [embed]
+            return poll_message
+
+        poll_message.edit.side_effect = save_poll_edit
+        unrelated = SimpleNamespace(id=101, author=bot_user, embeds=[])
+        older_poll = SimpleNamespace(
+            id=99,
+            author=bot_user,
+            embeds=[
+                build_schedule_embed(
+                    role,
+                    ["19:00", "20:00"],
+                    creator,
+                    auto_start=True,
+                )
+            ],
+        )
+        history_limits = []
+
+        def history(*, limit):
+            history_limits.append(limit)
+
+            async def iterator():
+                for candidate in (unrelated, poll_message, older_poll):
+                    yield candidate
+
+            return iterator()
+
+        bot_permissions = SimpleNamespace(
+            read_message_history=True,
+            embed_links=True,
+        )
+        creator_permissions = SimpleNamespace(manage_messages=False)
+
+        def permissions_for(member):
+            return bot_permissions if member is bot_user else creator_permissions
+
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=permissions_for,
+            history=history,
+            fetch_message=AsyncMock(return_value=poll_message),
+        )
+        bot = SimpleNamespace(user=bot_user)
+        cog = PollCog(bot, registry=self.registry)
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=creator,
+            interaction=object(),
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+
+        await PollCog.schedule_status.callback(cog, ctx)
+
+        channel.fetch_message.assert_awaited_once_with(poll_message.id)
+        self.assertIn("20:00", ctx.send.await_args.kwargs["embed"].description)
+
+        channel.fetch_message.reset_mock()
+        ctx.defer.reset_mock()
+        ctx.send.reset_mock()
+        await PollCog.schedule_close.callback(cog, ctx)
+
+        channel.fetch_message.assert_awaited_once_with(poll_message.id)
+        self.assertTrue(is_schedule_closed(poll_message.embeds[0]))
+        self.assertEqual(history_limits, [100, 100])
+
     async def test_deadline_sets_and_clears_persisted_deadline(self):
         bot_user = SimpleNamespace(id=1, bot=True)
         creator = SimpleNamespace(id=77, display_name="creator")
@@ -1492,6 +1607,66 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registered[0].deadline_at, deadline_at)
         self.assertEqual(cog._queue_schedule_deadline.call_count, 2)
         self.assertIn("投票をリセット", ctx.send.await_args.args[0])
+
+    async def test_prefix_update_and_deadline_can_omit_message_id(self):
+        bot_user = SimpleNamespace(id=1)
+        permissions = SimpleNamespace(
+            manage_messages=True,
+            read_message_history=True,
+            add_reactions=True,
+            embed_links=True,
+        )
+        channel = SimpleNamespace(
+            id=10,
+            name="general",
+            parent=None,
+            permissions_for=lambda _: permissions,
+        )
+        ctx = SimpleNamespace(
+            guild=SimpleNamespace(id=1, me=bot_user),
+            channel=channel,
+            author=SimpleNamespace(id=77, display_name="creator"),
+            interaction=None,
+            defer=AsyncMock(),
+            send=AsyncMock(),
+        )
+        cog = PollCog(
+            SimpleNamespace(user=bot_user),
+            now_provider=lambda: FIXED_NOW,
+            registry=self.registry,
+        )
+        cog._resolve_schedule_message_id = AsyncMock(return_value=99)
+        cog._update_schedule_message = AsyncMock()
+
+        await PollCog.schedule_update.callback(
+            cog,
+            ctx,
+            "15",
+            options="16 17 NG",
+        )
+
+        cog._resolve_schedule_message_id.assert_awaited_once_with(ctx, None)
+        cog._update_schedule_message.assert_awaited_once_with(
+            ctx,
+            99,
+            ["15:00", "16:00", "17:00", "NG"],
+        )
+
+        cog._resolve_schedule_message_id.reset_mock()
+        cog._change_schedule_deadline = AsyncMock()
+        await PollCog.schedule_deadline.callback(
+            cog,
+            ctx,
+            "2026-08-14",
+            deadline="19:00",
+        )
+
+        cog._resolve_schedule_message_id.assert_awaited_once_with(ctx, None)
+        cog._change_schedule_deadline.assert_awaited_once_with(
+            ctx,
+            99,
+            datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc),
+        )
 
     async def test_prefix_add_requires_an_actual_role_mention(self):
         bot = SimpleNamespace()

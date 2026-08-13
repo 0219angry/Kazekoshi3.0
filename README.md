@@ -28,6 +28,8 @@ source venv/bin/activate && python Kazekoshi.py
 
 サーバー内の任意のチャンネルで `/schedule add`、`/schedule status`、`/schedule clone`、`/schedule date`、`/schedule minimum`、`/schedule deadline`、`/schedule update`、`/schedule decide`、`/schedule close` を使用でき、
 対象には `@VALORANT` 以外も含む任意のロールを指定できます。
+`add` 以外は投稿ID・リンクを省略でき、省略時は同じチャンネルの直近100件から最新の
+開始時間投票を対象にします。
 `/schedule add` で対象ロールだけを指定した場合、候補には
 `20:00 20:30 21:00 21:30 22:00 22:30 23:00 24:00 NG` が自動で入ります。
 最低人数はデフォルトで5人です。コマンドの末尾に `[3]` のように1〜999人で指定すると、その投票だけ

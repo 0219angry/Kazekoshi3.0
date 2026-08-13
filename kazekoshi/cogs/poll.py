@@ -71,6 +71,7 @@ SCHEDULE_DEADLINE_VALUE_PATTERN = re.compile(r"<t:(?P<timestamp>\d+):F>")
 SCHEDULE_DECISION_FIELD_NAME = "確定開始"
 SCHEDULE_DATE_FIELD_NAME = "開催日"
 SCHEDULE_DATE_MAX_DAYS = 90
+LATEST_SCHEDULE_HISTORY_LIMIT = 100
 AUTO_START_MINIMUM_MARKER_PATTERN = (
     rf"(?<!\d)(?P<minimum>[1-9]\d{{0,2}})人で(?:自動)?開始判定"
 )
@@ -451,6 +452,13 @@ def parse_message_id(value: str) -> tuple[int, int | None]:
     if match is None:
         raise ScheduleInputError("投稿IDまたはDiscordの投稿リンクを指定してください")
     return int(match.group("message_id")), int(match.group("channel_id"))
+
+
+def looks_like_explicit_message_reference(value: str) -> bool:
+    value = value.strip()
+    if value.isdigit():
+        return len(value) >= 15
+    return MESSAGE_LINK_PATTERN.fullmatch(value) is not None
 
 
 def parse_schedule_deadline(
@@ -1172,14 +1180,14 @@ class PollCog(commands.Cog):
             "📅 開始時間投票コマンド\n"
             f"作成: `{prefix}schedule add @ロール [候補...]`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
-            f"状況確認: `{prefix}schedule status <投稿IDまたはリンク>`\n"
-            f"複製: `{prefix}schedule clone <投稿IDまたはリンク>`\n"
-            f"開催日: `{prefix}schedule date <投稿IDまたはリンク> 2026-08-14`\n"
-            f"最低人数変更: `{prefix}schedule minimum <投稿IDまたはリンク> 3`\n"
-            f"締切設定: `{prefix}schedule deadline <投稿IDまたはリンク> 2026-08-14 19:00`\n"
-            f"更新: `{prefix}schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`\n"
-            f"確定: `{prefix}schedule decide <投稿IDまたはリンク> 21:00`\n"
-            f"終了: `{prefix}schedule close <投稿IDまたはリンク>`"
+            f"状況確認: `{prefix}schedule status [投稿IDまたはリンク]`\n"
+            f"複製: `{prefix}schedule clone [投稿IDまたはリンク]`\n"
+            f"開催日: `{prefix}schedule date [投稿IDまたはリンク] 2026-08-14`\n"
+            f"最低人数変更: `{prefix}schedule minimum [投稿IDまたはリンク] 3`\n"
+            f"締切設定: `{prefix}schedule deadline [投稿IDまたはリンク] 2026-08-14 19:00`\n"
+            f"更新: `{prefix}schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`\n"
+            f"確定: `{prefix}schedule decide [投稿IDまたはリンク] 21:00`\n"
+            f"終了: `{prefix}schedule close [投稿IDまたはリンク]`"
         )
 
     @schedule.error
@@ -1357,23 +1365,15 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="status", description="開始時間投票の現在状況を表示します")
     @app_commands.describe(
-        message="確認する開始時間投票の投稿IDまたはリンク",
+        message="確認する投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
     )
     @commands.guild_only()
     async def schedule_status(
         self,
         ctx: commands.Context,
-        message: str,
+        message: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
-            return
-        try:
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
             return
 
         bot_member = ctx.guild.me
@@ -1396,6 +1396,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         poll_message = await self._fetch_schedule_poll(ctx, message_id)
         if poll_message is None:
@@ -1424,23 +1427,18 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="clone", description="開始時間投票の設定を複製します")
     @app_commands.describe(
-        message="複製する開始時間投票の投稿IDまたはリンク",
+        message="複製元の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
     )
     @commands.guild_only()
     async def schedule_clone(
         self,
         ctx: commands.Context,
-        message: str,
+        message: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
             return
-        try:
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
             return
 
         source_message = await self._fetch_schedule_poll(ctx, message_id)
@@ -1485,26 +1483,31 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="date", description="開始時間投票の開催日を設定します")
     @app_commands.describe(
-        message="開催日を設定する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
         date="開催日（YYYY-MM-DD）。投稿日に戻す場合は clear",
     )
     @commands.guild_only()
     async def schedule_date(
         self,
         ctx: commands.Context,
-        message: str,
-        date: str,
+        message: Optional[str] = None,
+        date: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
             return
+        if date is None:
+            date = message
+            message = None
+        if date is None:
+            await self._send_notice(
+                ctx,
+                "❌ 開催日を `YYYY-MM-DD`、`today`、または `clear` で指定してください",
+            )
+            return
         try:
             event_date = parse_schedule_date(date, now=self._utc_now())
-            message_id, link_channel_id = parse_message_id(message)
         except ScheduleInputError as error:
             await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
             return
 
         bot_member = ctx.guild.me
@@ -1527,6 +1530,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -1585,17 +1591,27 @@ class PollCog(commands.Cog):
         description="開始時間投票の自動判定人数を変更します",
     )
     @app_commands.describe(
-        message="変更する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
         minimum="自動開始と判定する最低人数（1〜999人）",
     )
     @commands.guild_only()
     async def schedule_minimum(
         self,
         ctx: commands.Context,
-        message: str,
-        minimum: int,
+        message: Optional[str] = None,
+        minimum: Optional[int] = None,
     ):
         if not await self._validate_schedule_context(ctx):
+            return
+        if minimum is None and message is not None:
+            try:
+                minimum = int(message)
+            except ValueError:
+                await self._send_notice(ctx, "❌ 最低人数は整数で指定してください")
+                return
+            message = None
+        if minimum is None:
+            await self._send_notice(ctx, "❌ 最低人数を指定してください")
             return
         if not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX:
             await self._send_notice(
@@ -1603,15 +1619,6 @@ class PollCog(commands.Cog):
                 f"❌ 最低人数は{AUTO_START_MINIMUM_MIN}〜{AUTO_START_MINIMUM_MAX}人で指定してください",
             )
             return
-        try:
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
-            return
-
         bot_member = ctx.guild.me
         if bot_member is None:
             await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
@@ -1632,6 +1639,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -1703,27 +1713,38 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="deadline", description="開始時間投票の締切を設定します")
     @app_commands.describe(
-        message="締切を設定する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
         deadline="日本時間の YYYY-MM-DD HH:MM。解除は clear",
     )
     @commands.guild_only()
     async def schedule_deadline(
         self,
         ctx: commands.Context,
-        message: str,
+        message: Optional[str] = None,
         *,
-        deadline: str,
+        deadline: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
             return
+        if (
+            ctx.interaction is None
+            and message is not None
+            and not looks_like_explicit_message_reference(message)
+        ):
+            deadline = " ".join(
+                part for part in (message, deadline) if part is not None
+            )
+            message = None
+        if deadline is None:
+            await self._send_notice(
+                ctx,
+                "❌ 締切を `YYYY-MM-DD HH:MM` または `clear` で指定してください",
+            )
+            return
         try:
             deadline_at = parse_schedule_deadline(deadline, now=self._utc_now())
-            message_id, link_channel_id = parse_message_id(message)
         except ScheduleInputError as error:
             await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
             return
 
         bot_member = ctx.guild.me
@@ -1746,6 +1767,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -1829,29 +1853,37 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="update", description="既存の開始時間投票を更新します")
     @app_commands.describe(
-        message="更新する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
         options="新しい候補（例: 21:00 22:00 24:00 NG）。更新時に投票はリセットされます",
     )
     @commands.guild_only()
     async def schedule_update(
         self,
         ctx: commands.Context,
-        message: str,
+        message: Optional[str] = None,
         *,
-        options: str,
+        options: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
             return
 
-        try:
-            option_list = parse_schedule_options(options)
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
+        if (
+            ctx.interaction is None
+            and message is not None
+            and not looks_like_explicit_message_reference(message)
+        ):
+            options = " ".join(
+                part for part in (message, options) if part is not None
+            )
+            message = None
+        if options is None:
+            await self._send_notice(ctx, "❌ 新しい候補を指定してください")
             return
 
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの日程投票を指定してください")
+        try:
+            option_list = parse_schedule_options(options)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
             return
 
         bot_member = ctx.guild.me
@@ -1875,6 +1907,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -2004,17 +2039,23 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="decide", description="開始時間を手動で確定します")
     @app_commands.describe(
-        message="確定する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
         time="候補に含まれる開始時刻（例: 21:00）",
     )
     @commands.guild_only()
     async def schedule_decide(
         self,
         ctx: commands.Context,
-        message: str,
-        time: str,
+        message: Optional[str] = None,
+        time: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
+            return
+        if time is None:
+            time = message
+            message = None
+        if time is None:
+            await self._send_notice(ctx, "❌ 確定する開始時刻を指定してください")
             return
         decided_start_time = normalize_schedule_time(time)
         if decided_start_time is None:
@@ -2023,15 +2064,6 @@ class PollCog(commands.Cog):
                 "❌ 開始時刻は `21`、`21:00`、`2100` のいずれかの形式で指定してください",
             )
             return
-        try:
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
-            return
-
         bot_member = ctx.guild.me
         if bot_member is None:
             await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
@@ -2058,6 +2090,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -2254,23 +2289,15 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="close", description="開始時間投票の自動判定を終了します")
     @app_commands.describe(
-        message="終了する開始時間投票の投稿IDまたはリンク",
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
     )
     @commands.guild_only()
     async def schedule_close(
         self,
         ctx: commands.Context,
-        message: str,
+        message: Optional[str] = None,
     ):
         if not await self._validate_schedule_context(ctx):
-            return
-        try:
-            message_id, link_channel_id = parse_message_id(message)
-        except ScheduleInputError as error:
-            await self._send_notice(ctx, f"❌ {error}")
-            return
-        if link_channel_id is not None and link_channel_id != ctx.channel.id:
-            await self._send_notice(ctx, "❌ 同じチャンネルの開始時間投票を指定してください")
             return
 
         bot_member = ctx.guild.me
@@ -2293,6 +2320,9 @@ class PollCog(commands.Cog):
             )
             return
 
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
         await ctx.defer(ephemeral=ctx.interaction is not None)
         lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
         async with lock:
@@ -2400,6 +2430,52 @@ class PollCog(commands.Cog):
             return None
 
         return poll_message
+
+    async def _resolve_schedule_message_id(
+        self,
+        ctx: commands.Context,
+        reference: str | None,
+    ) -> int | None:
+        if reference is not None:
+            try:
+                message_id, link_channel_id = parse_message_id(reference)
+            except ScheduleInputError as error:
+                await self._send_notice(ctx, f"❌ {error}")
+                return None
+            if link_channel_id is not None and link_channel_id != ctx.channel.id:
+                await self._send_notice(
+                    ctx,
+                    "❌ 同じチャンネルの開始時間投票を指定してください",
+                )
+                return None
+            return message_id
+
+        bot_user = self.bot.user
+        if bot_user is None:
+            await self._send_notice(ctx, "❌ Botのユーザー情報を取得できませんでした")
+            return None
+        history = getattr(ctx.channel, "history", None)
+        if history is None:
+            await self._send_notice(ctx, "❌ このチャンネルの投稿履歴を取得できません")
+            return None
+        try:
+            async for candidate in history(limit=LATEST_SCHEDULE_HISTORY_LIMIT):
+                if (
+                    candidate.author.id == bot_user.id
+                    and candidate.embeds
+                    and schedule_author_id(candidate.embeds[0]) is not None
+                ):
+                    return candidate.id
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("failed to find latest schedule poll")
+            await self._send_notice(ctx, "❌ このチャンネルの投稿履歴を取得できませんでした")
+            return None
+
+        await self._send_notice(
+            ctx,
+            f"❌ 直近{LATEST_SCHEDULE_HISTORY_LIMIT}件に開始時間投票が見つかりません",
+        )
+        return None
 
     async def _fetch_editable_schedule_poll(
         self,
@@ -3607,7 +3683,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule status <投稿IDまたはリンク>`",
+                "❌ 使い方: `/schedule status [投稿IDまたはリンク]`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3620,7 +3696,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule clone <投稿IDまたはリンク>`",
+                "❌ 使い方: `/schedule clone [投稿IDまたはリンク]`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3633,8 +3709,8 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule date <投稿IDまたはリンク> YYYY-MM-DD`\n"
-                "投稿日に戻す場合: `/schedule date <投稿IDまたはリンク> clear`",
+                "❌ 使い方: `/schedule date [投稿IDまたはリンク] YYYY-MM-DD`\n"
+                "投稿日に戻す場合: `/schedule date [投稿IDまたはリンク] clear`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3647,7 +3723,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule update <投稿IDまたはリンク> 21:00 22:00 24:00 NG`",
+                "❌ 使い方: `/schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3663,7 +3739,7 @@ class PollCog(commands.Cog):
         ):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule minimum <投稿IDまたはリンク> <1〜999>`",
+                "❌ 使い方: `/schedule minimum [投稿IDまたはリンク] <1〜999>`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3676,8 +3752,8 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule deadline <投稿IDまたはリンク> YYYY-MM-DD HH:MM`\n"
-                "解除する場合: `/schedule deadline <投稿IDまたはリンク> clear`",
+                "❌ 使い方: `/schedule deadline [投稿IDまたはリンク] YYYY-MM-DD HH:MM`\n"
+                "解除する場合: `/schedule deadline [投稿IDまたはリンク] clear`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3690,7 +3766,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule decide <投稿IDまたはリンク> <候補の時刻>`",
+                "❌ 使い方: `/schedule decide [投稿IDまたはリンク] <候補の時刻>`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -3703,7 +3779,7 @@ class PollCog(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule close <投稿IDまたはリンク>`",
+                "❌ 使い方: `/schedule close [投稿IDまたはリンク]`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
