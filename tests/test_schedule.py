@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, call
 
 import discord
 from discord.ext import commands
+from discord.ext.commands.view import StringView
 
 from kazekoshi.cogs.poll import (
     AUTO_START_GRACE_SECONDS,
@@ -22,6 +23,7 @@ from kazekoshi.cogs.poll import (
     ScheduleEffectConfig,
     ScheduleInputError,
     SchedulePollRegistry,
+    ScheduleTarget,
     announced_start_time,
     auto_start_minimum,
     build_schedule_embed,
@@ -34,13 +36,16 @@ from kazekoshi.cogs.poll import (
     load_schedule_effect_config,
     mark_schedule_closed,
     mark_start_time_announced,
+    merge_schedule_options,
     normalize_schedule_time,
     parse_schedule_add_options,
     parse_schedule_date,
     parse_schedule_deadline,
     parse_message_id,
+    parse_schedule_option_additions,
     parse_schedule_options,
     parse_schedule_effect_user_ids,
+    resolve_schedule_target,
     schedule_author_id,
     schedule_date_override,
     schedule_decided_start_time,
@@ -372,6 +377,93 @@ class ScheduleParsingTests(unittest.TestCase):
             parse_schedule_options('"8/21 21時" "8/22 22時" ng'),
             ["8/21 21時", "8/22 22時", "ng"],
         )
+
+    def test_parse_and_merge_option_additions_preserves_terminal_ng(self):
+        existing = ["21:00", "22:00", "NG"]
+
+        additions = parse_schedule_option_additions('23 2330 "8/23 24時"')
+        self.assertEqual(additions, ["23", "2330", "8/23 24時"])
+        self.assertEqual(parse_schedule_option_additions("24"), ["24"])
+
+        merged = merge_schedule_options(
+            existing,
+            additions[:2],
+            auto_start_enabled=True,
+        )
+
+        self.assertEqual(
+            merged,
+            ["21:00", "22:00", "23:00", "23:30", "NG"],
+        )
+        self.assertEqual(existing, ["21:00", "22:00", "NG"])
+        self.assertEqual(
+            schedule_option_emojis(merged)[:2],
+            schedule_option_emojis(existing)[:2],
+        )
+        self.assertEqual(schedule_option_emojis(merged)[-1], "🆖")
+
+    def test_merge_option_additions_rejects_duplicates_ng_errors_and_limit(self):
+        cases = (
+            (
+                ["21:00", "22:00", "NG"],
+                ["2100"],
+                True,
+                "同じ候補",
+            ),
+            (
+                ["21:00", "22:00", "NG"],
+                ["23", "2300"],
+                True,
+                "同じ候補",
+            ),
+            (
+                ["21:00", "22:00", "NG"],
+                ["ng"],
+                True,
+                "すでに候補",
+            ),
+            (
+                ["21:00", "22:00"],
+                ["NG", "23"],
+                True,
+                "NGは追加候補の末尾",
+            ),
+            (
+                [*[f"候補{index}" for index in range(20)]],
+                ["追加"],
+                False,
+                "最大20個",
+            ),
+            (
+                ["21:00", "22:00", "NG"],
+                ["平日"],
+                True,
+                "自動開始の投票",
+            ),
+        )
+
+        for existing, additions, auto_start, expected_message in cases:
+            with self.subTest(
+                existing=existing,
+                additions=additions,
+                auto_start=auto_start,
+            ):
+                original = list(existing)
+                with self.assertRaisesRegex(
+                    ScheduleInputError,
+                    expected_message,
+                ):
+                    merge_schedule_options(
+                        existing,
+                        additions,
+                        auto_start_enabled=auto_start,
+                    )
+                self.assertEqual(existing, original)
+
+        with self.assertRaisesRegex(ScheduleInputError, "1つ以上"):
+            parse_schedule_option_additions("")
+        with self.assertRaisesRegex(ScheduleInputError, "100文字以内"):
+            parse_schedule_option_additions("x" * 101)
 
     def test_parse_rejects_too_few_or_too_many_options(self):
         with self.assertRaisesRegex(ScheduleInputError, "2つ以上"):
@@ -750,6 +842,7 @@ class ScheduleDisplayTests(unittest.TestCase):
                 "date",
                 "minimum",
                 "deadline",
+                "option-add",
                 "update",
                 "decide",
                 "late",
@@ -759,10 +852,33 @@ class ScheduleDisplayTests(unittest.TestCase):
             ],
         )
         add_command = application_commands[0]
+        target_parameter = next(
+            parameter for parameter in add_command.parameters if parameter.name == "target"
+        )
+        self.assertTrue(target_parameter.required)
+        self.assertNotIn(
+            "role",
+            [parameter.name for parameter in add_command.parameters],
+        )
         options_parameter = next(
             parameter for parameter in add_command.parameters if parameter.name == "options"
         )
         self.assertFalse(options_parameter.required)
+        option_add_command = next(
+            command
+            for command in application_commands
+            if command.name == "option-add"
+        )
+        self.assertEqual(
+            [parameter.name for parameter in option_add_command.parameters],
+            ["message", "options"],
+        )
+        self.assertTrue(
+            all(
+                not parameter.required
+                for parameter in option_add_command.parameters
+            )
+        )
         late_command = next(
             command
             for command in application_commands
@@ -780,6 +896,7 @@ class ScheduleDisplayTests(unittest.TestCase):
             "date",
             "minimum",
             "deadline",
+            "option-add",
             "update",
             "decide",
             "lateoff",
@@ -938,6 +1055,92 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             f"{self.temp_directory.name}/schedule-polls.sqlite3"
         )
 
+    def make_option_add_fixture(
+        self,
+        *,
+        options=None,
+        auto_start=True,
+        registered=True,
+    ):
+        bot_member = SimpleNamespace(id=1, bot=True)
+        bot = SimpleNamespace(user=bot_member)
+        creator = SimpleNamespace(id=77, display_name="creator")
+        role = SimpleNamespace(
+            id=88,
+            name="GAME",
+            mention="<@&88>",
+        )
+        option_list = options or ["21:00", "22:00", "NG"]
+        embed = build_schedule_embed(
+            role,
+            option_list,
+            creator,
+            auto_start=auto_start,
+            minimum=3,
+        )
+        reactions = []
+        humans = {
+            user_id: SimpleNamespace(id=user_id, bot=False)
+            for user_id in range(2, 8)
+        }
+        voters = {
+            "21:00": {2, 3},
+            "22:00": {4, 5},
+            "NG": {6},
+        }
+        for option, emoji in zip(option_list, schedule_option_emojis(option_list)):
+            users = [bot_member]
+            users.extend(humans[user_id] for user_id in voters.get(option, set()))
+            reaction = FakeReaction(emoji, users, me=True)
+            reaction.count = len(users)
+            reactions.append(reaction)
+
+        poll_message = SimpleNamespace(
+            id=99,
+            author=bot_member,
+            content=role.mention,
+            role_mentions=[role],
+            mentions=[],
+            guild=SimpleNamespace(get_role=lambda role_id: role),
+            embeds=[embed],
+            reactions=reactions,
+            jump_url="https://discord.com/channels/1/10/99",
+            add_reaction=AsyncMock(),
+            remove_reaction=AsyncMock(),
+            clear_reaction=AsyncMock(),
+            edit=AsyncMock(),
+        )
+
+        async def save_edit(*, embed):
+            poll_message.embeds = [embed]
+            return poll_message
+
+        poll_message.edit.side_effect = save_edit
+        channel = SimpleNamespace(
+            id=10,
+            permissions_for=lambda _: SimpleNamespace(manage_messages=False),
+            fetch_message=AsyncMock(return_value=poll_message),
+        )
+        guild = SimpleNamespace(id=1, me=bot_member)
+        ctx = SimpleNamespace(
+            bot=bot,
+            guild=guild,
+            channel=channel,
+            author=creator,
+            interaction=object(),
+            send=AsyncMock(),
+        )
+        cog = PollCog(bot, registry=self.registry)
+        cog._lateness_registry.get_event = Mock(return_value=None)
+        cog._queue_auto_start_check_by_id = Mock()
+        if auto_start and registered:
+            cog._register_schedule_poll(
+                guild_id=guild.id,
+                channel_id=channel.id,
+                message_id=poll_message.id,
+            )
+        return cog, ctx, poll_message, bot_member
+
     async def test_cog_registers_schedule_application_group(self):
         bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
         try:
@@ -953,6 +1156,7 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
                     "date",
                     "minimum",
                     "deadline",
+                    "option-add",
                     "update",
                     "decide",
                     "late",
@@ -963,6 +1167,331 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await bot.close()
+
+    async def test_add_target_autocomplete_prioritizes_safe_exact_matches(self):
+        roles = [
+            SimpleNamespace(
+                name="@everyone",
+                mention="<@&1>",
+                is_default=lambda: True,
+            ),
+            SimpleNamespace(
+                name="Raid",
+                mention="<@&88>",
+                is_default=lambda: False,
+            ),
+        ]
+        members = [
+            SimpleNamespace(
+                name=f"raid-member-{index:02d}",
+                display_name=f"Raid member {index:02d}",
+                mention=f"<@{100 + index}>",
+            )
+            for index in range(30)
+        ]
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(roles=roles, members=members)
+        )
+        cog = PollCog(SimpleNamespace(), registry=self.registry)
+
+        partial = await cog.schedule_add_target_autocomplete(interaction, "@e")
+        self.assertEqual(partial[0].value, "@e")
+        self.assertEqual(partial[0].name, "表示のみ: @e")
+        self.assertIn("@everyone", [choice.value for choice in partial])
+
+        broadcast = await cog.schedule_add_target_autocomplete(
+            interaction,
+            "@everyone",
+        )
+        self.assertEqual(broadcast[0].value, "@everyone")
+        self.assertNotIn(
+            "表示のみ: @everyone",
+            [choice.name for choice in broadcast],
+        )
+
+        capitalized_label = await cog.schedule_add_target_autocomplete(
+            interaction,
+            "@Everyone",
+        )
+        self.assertEqual(capitalized_label[0].value, "@Everyone")
+        self.assertNotIn(
+            "@everyone",
+            [choice.value for choice in capitalized_label],
+        )
+
+        exact_role = await cog.schedule_add_target_autocomplete(
+            interaction,
+            "@Raid",
+        )
+        self.assertEqual(exact_role[0].value, "<@&88>")
+        self.assertLessEqual(len(exact_role), 25)
+
+    async def test_discordpy_prefix_parser_passes_target_and_time_options(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        cog = PollCog(bot, registry=self.registry)
+        try:
+            await bot.add_cog(cog)
+            schedule_command = bot.get_command("schedule")
+            self.assertIsNotNone(schedule_command)
+            bot_member = SimpleNamespace(id=1)
+            author = SimpleNamespace(id=77, display_name="tester")
+            permissions = SimpleNamespace(
+                mention_everyone=False,
+                send_messages=True,
+                send_messages_in_threads=True,
+                read_message_history=True,
+                add_reactions=True,
+                embed_links=True,
+            )
+            channel = SimpleNamespace(
+                id=10,
+                name="general",
+                parent=None,
+                permissions_for=lambda _: permissions,
+            )
+            poll_message = SimpleNamespace(id=99, add_reaction=AsyncMock())
+            message = SimpleNamespace(
+                _state=bot._connection,
+                guild=SimpleNamespace(
+                    id=1,
+                    me=bot_member,
+                    get_role=lambda _: None,
+                    get_member=lambda _: None,
+                ),
+                author=author,
+                channel=channel,
+                content="!schedule add @ゲーム名 21 22 23 ng",
+                role_mentions=[],
+                mentions=[],
+                mention_everyone=False,
+                attachments=[],
+            )
+            ctx = commands.Context(
+                message=message,
+                bot=bot,
+                view=StringView("add @ゲーム名 21 22 23 ng"),
+                prefix="!",
+                command=schedule_command,
+                invoked_with="schedule",
+            )
+            ctx.send = AsyncMock(return_value=poll_message)
+
+            await schedule_command.invoke(ctx)
+
+            sent = ctx.send.await_args.kwargs
+            self.assertEqual(sent["content"], "@ゲーム名")
+            self.assertEqual(sent["embed"].title, "📅 @ゲーム名 開始時間 [5人]")
+            self.assertEqual(
+                sent["embed"].description,
+                "1️⃣21:00, 2️⃣22:00, 3️⃣23:00, 🆖NG",
+            )
+            self.assertEqual(
+                [
+                    call.args[0]
+                    for call in poll_message.add_reaction.await_args_list
+                ],
+                ["1️⃣", "2️⃣", "3️⃣", "🆖"],
+            )
+            self.assertEqual(len(self.registry.all()), 1)
+        finally:
+            await bot.close()
+
+    async def test_discordpy_prefix_parser_passes_option_add_with_optional_id(self):
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        cog = PollCog(bot, registry=self.registry)
+        try:
+            await bot.add_cog(cog)
+            schedule_command = bot.get_command("schedule")
+            self.assertIsNotNone(schedule_command)
+            bot_member = SimpleNamespace(id=1)
+            guild = SimpleNamespace(id=1, me=bot_member)
+            author = SimpleNamespace(id=77, display_name="tester")
+            permissions = SimpleNamespace(
+                read_message_history=True,
+                add_reactions=True,
+                embed_links=True,
+            )
+            channel = SimpleNamespace(
+                id=10,
+                permissions_for=lambda _: permissions,
+            )
+            cog._resolve_schedule_message_id = AsyncMock(return_value=999)
+            cog._add_schedule_options_to_message = AsyncMock()
+
+            async def invoke(argument_text):
+                message = SimpleNamespace(
+                    _state=bot._connection,
+                    guild=guild,
+                    author=author,
+                    channel=channel,
+                    content=f"!schedule {argument_text}",
+                    attachments=[],
+                )
+                ctx = commands.Context(
+                    message=message,
+                    bot=bot,
+                    view=StringView(argument_text),
+                    prefix="!",
+                    command=schedule_command,
+                    invoked_with="schedule",
+                )
+                ctx.defer = AsyncMock()
+                ctx.send = AsyncMock()
+                await schedule_command.invoke(ctx)
+                return ctx
+
+            latest_ctx = await invoke('option-add "8/23 24時" 23')
+            cog._resolve_schedule_message_id.assert_awaited_once_with(
+                latest_ctx,
+                None,
+            )
+            cog._add_schedule_options_to_message.assert_awaited_once_with(
+                latest_ctx,
+                999,
+                ["8/23 24時", "23"],
+            )
+
+            cog._resolve_schedule_message_id.reset_mock()
+            cog._add_schedule_options_to_message.reset_mock()
+            message_id = schedule_snowflake(FIXED_NOW)
+            explicit_ctx = await invoke(
+                f'option-add {message_id} "8/23 23時"'
+            )
+            cog._resolve_schedule_message_id.assert_awaited_once_with(
+                explicit_ctx,
+                str(message_id),
+            )
+            cog._add_schedule_options_to_message.assert_awaited_once_with(
+                explicit_ctx,
+                999,
+                ["8/23 23時"],
+            )
+        finally:
+            await bot.close()
+
+    async def test_option_add_preserves_votes_ng_registry_and_footer_state(self):
+        cog, ctx, poll_message, _ = self.make_option_add_fixture()
+        deadline_at = FIXED_NOW + timedelta(days=1)
+        set_schedule_deadline(poll_message.embeds[0], deadline_at)
+        mark_start_time_announced(poll_message.embeds[0], "22:00", 500)
+        original_footer = poll_message.embeds[0].footer.text
+        original_reactions = list(poll_message.reactions)
+        foreign_reaction = SimpleNamespace(emoji="🎉", me=False, count=1)
+        poll_message.reactions.append(foreign_reaction)
+        registered_before = self.registry.all()
+
+        await cog._add_schedule_options_to_message(ctx, 99, ["20"])
+
+        updated_embed = poll_message.embeds[0]
+        self.assertEqual(
+            schedule_options_from_embed(updated_embed),
+            ["21:00", "22:00", "20:00", "NG"],
+        )
+        self.assertEqual(
+            updated_embed.description,
+            "1️⃣21:00, 2️⃣22:00, 3️⃣20:00, 🆖NG",
+        )
+        self.assertEqual(updated_embed.footer.text, original_footer)
+        self.assertEqual(schedule_deadline_at(updated_embed), deadline_at)
+        self.assertEqual(start_announcement(updated_embed).start_time, "22:00")
+        self.assertEqual(start_announcement(updated_embed).message_id, 500)
+        self.assertEqual(self.registry.all(), registered_before)
+        self.assertEqual(
+            poll_message.reactions,
+            [*original_reactions, foreign_reaction],
+        )
+        for original, current in zip(
+            original_reactions,
+            poll_message.reactions,
+        ):
+            self.assertIs(current, original)
+            self.assertEqual(current._users, original._users)
+        poll_message.add_reaction.assert_awaited_once_with("3️⃣")
+        poll_message.clear_reaction.assert_not_awaited()
+        poll_message.remove_reaction.assert_not_awaited()
+        cog._queue_auto_start_check_by_id.assert_called_once_with(
+            guild_id=1,
+            channel_id=10,
+            message_id=99,
+        )
+        self.assertIn("既存の投票は保持", ctx.send.await_args.args[0])
+
+    async def test_option_add_rejects_unsafe_or_invalid_existing_poll(self):
+        cases = ("legacy", "collision", "closed", "duplicate")
+        for case_name in cases:
+            with self.subTest(case=case_name):
+                cog, ctx, poll_message, _ = self.make_option_add_fixture(
+                    registered=False,
+                )
+                additions = ["23"]
+                expected = None
+                if case_name == "legacy":
+                    poll_message.embeds[0].description = (
+                        "1️⃣：21\n2️⃣：22\n3️⃣：ng"
+                    )
+                    expected = "旧形式"
+                elif case_name == "collision":
+                    poll_message.reactions.append(
+                        SimpleNamespace(emoji="3️⃣", me=False, count=1)
+                    )
+                    expected = "すでに投票外で使われています"
+                elif case_name == "closed":
+                    mark_schedule_closed(poll_message.embeds[0])
+                    expected = "終了済み"
+                else:
+                    additions = ["2100"]
+                    expected = "同じ候補"
+                original_description = poll_message.embeds[0].description
+                registered_before = self.registry.all()
+
+                await cog._add_schedule_options_to_message(
+                    ctx,
+                    poll_message.id,
+                    additions,
+                )
+
+                self.assertIn(expected, ctx.send.await_args.args[0])
+                self.assertEqual(
+                    poll_message.embeds[0].description,
+                    original_description,
+                )
+                self.assertEqual(self.registry.all(), registered_before)
+                poll_message.add_reaction.assert_not_awaited()
+                poll_message.edit.assert_not_awaited()
+                poll_message.clear_reaction.assert_not_awaited()
+                poll_message.remove_reaction.assert_not_awaited()
+                cog._queue_auto_start_check_by_id.assert_not_called()
+
+    async def test_option_add_rolls_back_own_reaction_when_embed_edit_fails(self):
+        cog, ctx, poll_message, bot_member = self.make_option_add_fixture()
+        response = Mock(status=500, reason="Server Error")
+        poll_message.edit.side_effect = discord.HTTPException(
+            response,
+            {"message": "temporary", "code": 0},
+        )
+        original_embed = poll_message.embeds[0]
+        registered_before = self.registry.all()
+
+        await cog._add_schedule_options_to_message(ctx, 99, ["23"])
+
+        poll_message.add_reaction.assert_awaited_once_with("3️⃣")
+        poll_message.remove_reaction.assert_awaited_once_with(
+            "3️⃣",
+            bot_member,
+        )
+        poll_message.clear_reaction.assert_not_awaited()
+        self.assertIs(poll_message.embeds[0], original_embed)
+        self.assertEqual(
+            schedule_options_from_embed(poll_message.embeds[0]),
+            ["21:00", "22:00", "NG"],
+        )
+        self.assertEqual(self.registry.all(), registered_before)
+        cog._queue_auto_start_check_by_id.assert_called_once_with(
+            guild_id=1,
+            channel_id=10,
+            message_id=99,
+        )
+        self.assertIn("候補と既存票は変更していません", ctx.send.await_args.args[0])
 
     async def test_add_posts_embed_and_number_reactions(self):
         bot = SimpleNamespace()
@@ -1055,6 +1584,184 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in poll_message.add_reaction.await_args_list],
             ["1️⃣", "2️⃣", "3️⃣", "🆖"],
         )
+
+    async def test_add_supports_user_label_everyone_and_here_mentions(self):
+        member = SimpleNamespace(
+            id=66, name="alice", display_name="Alice", mention="<@66>"
+        )
+        permissions = SimpleNamespace(
+            mention_everyone=True,
+            send_messages=True,
+            send_messages_in_threads=True,
+            read_message_history=True,
+            add_reactions=True,
+            embed_links=True,
+        )
+        guild = SimpleNamespace(
+            id=1,
+            me=SimpleNamespace(id=1),
+            roles=[],
+            members=[member],
+            get_role=lambda _: None,
+            get_member=lambda user_id: member if user_id == member.id else None,
+        )
+        bot = SimpleNamespace()
+        cog = PollCog(bot, registry=self.registry)
+        ctx = SimpleNamespace(
+            bot=bot,
+            guild=guild,
+            channel=SimpleNamespace(
+                id=10,
+                name="general",
+                parent=None,
+                permissions_for=lambda _: permissions,
+            ),
+            author=SimpleNamespace(id=77, display_name="tester"),
+            interaction=object(),
+        )
+        cases = {
+            "<@66>": discord.AllowedMentions(
+                users=[member], roles=False, everyone=False, replied_user=False
+            ),
+            "@ゲーム名": discord.AllowedMentions.none(),
+            "@everyone": discord.AllowedMentions(
+                everyone=True, users=False, roles=False, replied_user=False
+            ),
+            "@here": discord.AllowedMentions(
+                everyone=True, users=False, roles=False, replied_user=False
+            ),
+        }
+        for message_id, (raw_target, expected_mentions) in enumerate(
+            cases.items(), start=100
+        ):
+            with self.subTest(target=raw_target):
+                poll = SimpleNamespace(id=message_id, add_reaction=AsyncMock())
+                ctx.send = AsyncMock(return_value=poll)
+                target = await resolve_schedule_target(ctx, raw_target)
+
+                await PollCog.schedule_add.callback(
+                    cog, ctx, target, options="15 16 NG [3]"
+                )
+
+                sent = ctx.send.await_args.kwargs
+                self.assertEqual(sent["content"], raw_target)
+                self.assertEqual(
+                    sent["allowed_mentions"].to_dict(),
+                    expected_mentions.to_dict(),
+                )
+                self.assertEqual(
+                    sent["embed"].title,
+                    f"📅 {target.name} 開始時間 [3人]",
+                )
+
+    async def test_prefix_add_accepts_display_label_without_ping(self):
+        permissions = SimpleNamespace(
+            mention_everyone=False,
+            send_messages=True,
+            send_messages_in_threads=True,
+            read_message_history=True,
+            add_reactions=True,
+            embed_links=True,
+        )
+        poll_message = SimpleNamespace(id=99, add_reaction=AsyncMock())
+        ctx = SimpleNamespace(
+            bot=SimpleNamespace(),
+            guild=SimpleNamespace(id=1, me=SimpleNamespace(id=1)),
+            channel=SimpleNamespace(
+                id=10,
+                name="general",
+                parent=None,
+                permissions_for=lambda _: permissions,
+            ),
+            author=SimpleNamespace(id=77, display_name="tester"),
+            interaction=None,
+            message=SimpleNamespace(
+                content="!schedule add @ゲーム名 15 16 NG [3]",
+                role_mentions=[],
+                mentions=[],
+                mention_everyone=False,
+            ),
+            send=AsyncMock(return_value=poll_message),
+        )
+        cog = PollCog(ctx.bot, registry=self.registry)
+
+        await PollCog.schedule_add.callback(
+            cog,
+            ctx,
+            "@ゲーム名",
+            options="15 16 NG [3]",
+        )
+
+        sent = ctx.send.await_args.kwargs
+        self.assertEqual(sent["content"], "@ゲーム名")
+        self.assertEqual(sent["embed"].title, "📅 @ゲーム名 開始時間 [3人]")
+        self.assertEqual(
+            sent["allowed_mentions"].to_dict(),
+            discord.AllowedMentions.none().to_dict(),
+        )
+
+    async def test_broadcast_targets_require_author_and_bot_permissions(self):
+        for target_kind, author_can_mention, bot_can_mention, expected in (
+            ("everyone", False, True, "メンションする権限"),
+            ("here", True, False, "Botに"),
+        ):
+            with self.subTest(
+                target_kind=target_kind,
+                author_can_mention=author_can_mention,
+                bot_can_mention=bot_can_mention,
+            ):
+                bot_member = SimpleNamespace(id=1)
+                author = SimpleNamespace(id=77, display_name="tester")
+                bot_permissions = SimpleNamespace(
+                    mention_everyone=bot_can_mention,
+                    send_messages=True,
+                    send_messages_in_threads=True,
+                    read_message_history=True,
+                    add_reactions=True,
+                    embed_links=True,
+                )
+                author_permissions = SimpleNamespace(
+                    mention_everyone=author_can_mention,
+                )
+
+                def permissions_for(member):
+                    return (
+                        bot_permissions
+                        if member is bot_member
+                        else author_permissions
+                    )
+
+                ctx = SimpleNamespace(
+                    bot=SimpleNamespace(),
+                    guild=SimpleNamespace(id=1, me=bot_member),
+                    channel=SimpleNamespace(
+                        id=10,
+                        name="general",
+                        parent=None,
+                        permissions_for=permissions_for,
+                    ),
+                    author=author,
+                    interaction=object(),
+                    send=AsyncMock(),
+                )
+                cog = PollCog(ctx.bot, registry=self.registry)
+
+                await PollCog.schedule_add.callback(
+                    cog,
+                    ctx,
+                    ScheduleTarget(
+                        target_kind,
+                        f"@{target_kind}",
+                        f"@{target_kind}",
+                    ),
+                )
+
+                self.assertIn(expected, ctx.send.await_args.args[0])
+                self.assertNotIn("embed", ctx.send.await_args.kwargs)
+                self.assertEqual(
+                    ctx.send.await_args.kwargs["allowed_mentions"].to_dict(),
+                    discord.AllowedMentions.none().to_dict(),
+                )
 
     async def test_clone_is_available_to_anyone_and_copies_only_poll_settings(self):
         bot_user = SimpleNamespace(id=1, bot=True)
@@ -1784,7 +2491,12 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
             embed_links=True,
         )
         author = SimpleNamespace(id=77, display_name="tester")
-        role = SimpleNamespace(name="VALORANT")
+        role = SimpleNamespace(
+            id=55,
+            name="VALORANT",
+            mention="<@&55>",
+            mentionable=True,
+        )
         original_embed = build_schedule_embed(
             role,
             list(DEFAULT_SCHEDULE_OPTION_LIST),
@@ -1803,6 +2515,10 @@ class ScheduleCommandTests(unittest.IsolatedAsyncioTestCase):
         poll_message = SimpleNamespace(
             id=99,
             author=bot_user,
+            content=role.mention,
+            role_mentions=[role],
+            mentions=[],
+            guild=SimpleNamespace(get_role=lambda role_id: role),
             embeds=[original_embed],
             reactions=[
                 SimpleNamespace(emoji="1️⃣"),
@@ -2163,11 +2879,83 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.harness.channel.send.assert_awaited_once()
         notification = self.harness.channel.send.await_args
-        self.assertEqual(notification.kwargs["content"], "20:00 開始 <@&88>")
+        self.assertEqual(notification.kwargs["content"], "✅ 20:00 開始 <@&88>")
         self.assertEqual(notification.kwargs["allowed_mentions"].roles, [self.harness.role])
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "20:00")
         self.assertEqual(announcement.message_id, 1000)
+
+    async def test_display_label_auto_start_is_display_only(self):
+        target = ScheduleTarget("label", "@ゲーム名", "@ゲーム名")
+        self.harness.poll_message.content = target.mention
+        self.harness.poll_message.role_mentions = []
+        self.harness.poll_message.embeds = [
+            build_schedule_embed(
+                target,
+                list(DEFAULT_SCHEDULE_OPTION_LIST),
+                self.harness.creator,
+                auto_start=True,
+            )
+        ]
+
+        notification = await self.announce(
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
+        )
+
+        self.assertEqual(notification.content, "✅ 20:00 開始 @ゲーム名")
+        self.assert_allowed_mentions_none(notification.allowed_mentions)
+
+    async def test_everyone_auto_start_pings_once(self):
+        target = ScheduleTarget("everyone", "@everyone", "@everyone")
+        self.harness.poll_message.content = target.mention
+        self.harness.poll_message.role_mentions = []
+        self.harness.poll_message.embeds = [
+            build_schedule_embed(
+                target,
+                list(DEFAULT_SCHEDULE_OPTION_LIST),
+                self.harness.creator,
+                auto_start=True,
+            )
+        ]
+
+        first_notification = await self.announce(
+            {"20:00": {2, 3, 4, 5, 6}},
+            "20:00",
+        )
+
+        self.assertEqual(first_notification.content, "✅ 20:00 開始 @everyone")
+        self.assertEqual(
+            first_notification.allowed_mentions.to_dict(),
+            discord.AllowedMentions(
+                everyone=True,
+                users=False,
+                roles=False,
+                replied_user=False,
+            ).to_dict(),
+        )
+
+        self.harness.channel.send.reset_mock()
+        self.harness.set_voters(
+            {
+                "20:00": {2, 3, 4, 5},
+                "20:30": {6},
+            }
+        )
+        sleep_call, task = await self.queue_check(
+            "remove",
+            emoji="1️⃣",
+            user_id=6,
+        )
+        await self.finish_check(sleep_call, task)
+
+        self.assert_allowed_mentions_none(first_notification.allowed_mentions)
+        replacement = self.harness.channel.send.await_args.kwargs
+        self.assertEqual(
+            replacement["content"],
+            "✅ 20:30 開始 @everyone（🔄 20:00 開始から変更されました）",
+        )
+        self.assert_allowed_mentions_none(replacement["allowed_mentions"])
 
     async def test_schedule_effect_roll_one_plays_rush_once_and_deletes_it(self):
         self.enable_schedule_effect({2}, [1])
@@ -2373,7 +3161,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.harness.channel.send.await_args.kwargs["content"],
-            "16:00 開始 <@&88>",
+            "✅ 16:00 開始 <@&88>",
         )
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
@@ -2553,7 +3341,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         cancellation_notice = self.harness.notifications[1001]
         cancellation_notice.delete.assert_awaited_once()
         self.assert_allowed_mentions_none(cancellation_notice.allowed_mentions)
-        self.assertEqual(old_notification.content, "20:00 開始 <@&88>")
+        self.assertEqual(old_notification.content, "✅ 20:00 開始 <@&88>")
         self.assert_allowed_mentions_none(old_notification.allowed_mentions)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "20:00")
@@ -2915,8 +3703,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("24:00 開始へ変更", old_content)
         self.harness.channel.send.assert_awaited_once()
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertIn("24:00 開始 <@&88>", replacement["content"])
-        self.assertIn("23:00 開始から変更", replacement["content"])
+        self.assertEqual(
+            replacement["content"],
+            "✅ 24:00 開始 <@&88>（🔄 23:00 開始から変更されました）",
+        )
         self.assertFalse(replacement["allowed_mentions"].roles)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "24:00")
@@ -2946,7 +3736,10 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("21:00 開始へ変更", old_notification.content)
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertIn("21:00 開始 <@&88>", replacement["content"])
+        self.assertEqual(
+            replacement["content"],
+            "✅ 21:00 開始 <@&88>（🔄 20:00 開始から変更されました）",
+        )
         self.assertFalse(replacement["allowed_mentions"].roles)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "21:00")
@@ -3066,7 +3859,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_check(restore_sleep, restore_task)
 
         restored = self.harness.channel.send.await_args.kwargs
-        self.assertEqual(restored["content"], "20:00 開始 <@&88>")
+        self.assertEqual(restored["content"], "✅ 20:00 開始 <@&88>")
         self.assertFalse(restored["allowed_mentions"].roles)
         self.assertEqual(
             start_announcement(self.harness.poll_message.embeds[0]).start_time,
@@ -3090,7 +3883,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_check(self.sleeper.calls[call_index], task)
 
         replacement = self.harness.channel.send.await_args.kwargs
-        self.assertEqual(replacement["content"], "20:00 開始 <@&88>")
+        self.assertEqual(replacement["content"], "✅ 20:00 開始 <@&88>")
         self.assertFalse(replacement["allowed_mentions"].roles)
         self.assertNotEqual(
             start_announcement(self.harness.poll_message.embeds[0]).message_id,
@@ -3148,7 +3941,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_check(self.sleeper.calls[1], pending_check)
 
         replacement = self.harness.notifications[1001]
-        self.assertEqual(replacement.content, "20:00 開始 <@&88>")
+        self.assertEqual(replacement.content, "✅ 20:00 開始 <@&88>")
         self.assert_allowed_mentions_none(replacement.allowed_mentions)
         announcement = start_announcement(self.harness.poll_message.embeds[0])
         self.assertEqual(announcement.start_time, "20:00")
@@ -3164,7 +3957,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertIn("~~20:00 開始 <@&88>~~", notification.content)
+        self.assertIn("~~✅ 20:00 開始 <@&88>~~", notification.content)
         self.assertIn("投票が削除", notification.content)
         self.assertEqual(self.registry.all(), [])
 
@@ -3223,7 +4016,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
             await transition_task
         await deletion_task
 
-        self.assertIn("~~20:00 開始 <@&88>~~", old_notification.content)
+        self.assertIn("~~✅ 20:00 開始 <@&88>~~", old_notification.content)
         self.assertIn("投票が削除", old_notification.content)
         replacement = self.harness.notifications[1001]
         replacement.delete.assert_awaited_once()
@@ -3448,7 +4241,7 @@ class ScheduleAutoStartTransitionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             self.harness.channel.send.await_args.kwargs["content"],
-            "20:00 開始 <@&88>",
+            "✅ 20:00 開始 <@&88>",
         )
 
     async def test_deadline_survives_registry_and_closes_active_poll(self):
