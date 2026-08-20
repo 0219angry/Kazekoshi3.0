@@ -1,5 +1,6 @@
 import asyncio
 import configparser
+import heapq
 import random
 import re
 import shlex
@@ -45,6 +46,9 @@ MESSAGE_LINK_PATTERN = re.compile(
     r"(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
 )
 ROLE_MENTION_PATTERN = re.compile(r"<@&(\d+)>")
+USER_MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+SPECIAL_SCHEDULE_TARGETS = frozenset({"@everyone", "@here"})
+SCHEDULE_LABEL_PATTERN = re.compile(r"@[^\s@<>]{1,80}")
 MIN_SCHEDULE_OPTIONS = 2
 MAX_SCHEDULE_OPTIONS = len(OPTION_EMOJIS)
 MAX_SCHEDULE_OPTION_LENGTH = 100
@@ -142,6 +146,38 @@ _CANCELLED_USER_UNCHANGED = object()
 
 class ScheduleInputError(ValueError):
     """開始時間投票の入力値が不正な場合に送出する例外。"""
+
+
+@dataclass(frozen=True)
+class ScheduleTarget:
+    """開始時間の作成時と確定時に通知する対象。"""
+
+    kind: str
+    mention: str
+    name: str
+    entity: object | None = None
+
+    @property
+    def id(self) -> int | None:
+        entity_id = getattr(self.entity, "id", None)
+        if entity_id is not None:
+            return int(entity_id)
+        pattern = (
+            ROLE_MENTION_PATTERN
+            if self.kind == "role"
+            else USER_MENTION_PATTERN
+        )
+        match = pattern.fullmatch(self.mention)
+        return int(match.group(1)) if match is not None else None
+
+
+class ScheduleTargetConverter(commands.Converter):
+    async def convert(
+        self,
+        ctx: commands.Context,
+        argument: str,
+    ) -> ScheduleTarget:
+        return await resolve_schedule_target(ctx, argument)
 
 
 @dataclass(frozen=True)
@@ -476,6 +512,93 @@ def parse_schedule_options(value: str) -> list[str]:
     return normalized_options if normalized_options is not None else options
 
 
+def parse_schedule_option_additions(value: str) -> list[str]:
+    """既存票へ追加する、1個以上の候補だけを解析する。"""
+    try:
+        options = [option.strip() for option in shlex.split(value) if option.strip()]
+    except ValueError as error:
+        raise ScheduleInputError("引用符が閉じられていません") from error
+
+    if not options:
+        raise ScheduleInputError("追加する候補を1つ以上入力してください")
+    if len(options) > MAX_SCHEDULE_OPTIONS:
+        raise ScheduleInputError(f"候補は最大{MAX_SCHEDULE_OPTIONS}個です")
+    if any(len(option) > MAX_SCHEDULE_OPTION_LENGTH for option in options):
+        raise ScheduleInputError(
+            f"候補は1つにつき{MAX_SCHEDULE_OPTION_LENGTH}文字以内にしてください"
+        )
+    return options
+
+
+def merge_schedule_options(
+    existing_options: list[str],
+    additions: list[str],
+    *,
+    auto_start_enabled: bool,
+) -> list[str]:
+    """既存の絵文字対応を保ったまま、候補を末尾NGの直前へ追加する。"""
+    if any(option.casefold() == "ng" for option in existing_options[:-1]):
+        raise ScheduleInputError(
+            "末尾以外にNGがある投票には、票を維持したまま候補を追加できません"
+        )
+
+    existing_has_ng = bool(
+        existing_options and existing_options[-1].casefold() == "ng"
+    )
+    addition_ng_indexes = [
+        index
+        for index, option in enumerate(additions)
+        if option.casefold() == "ng"
+    ]
+    if addition_ng_indexes:
+        if (
+            len(addition_ng_indexes) > 1
+            or addition_ng_indexes[0] != len(additions) - 1
+        ):
+            raise ScheduleInputError("NGは追加候補の末尾に1つだけ指定してください")
+        if existing_has_ng:
+            raise ScheduleInputError("NGはすでに候補にあります")
+
+    additions_without_ng = (
+        additions[:-1] if addition_ng_indexes else additions
+    )
+
+    def duplicate_key(option: str) -> tuple[str, str]:
+        normalized_time = normalize_schedule_time(option)
+        if normalized_time is not None:
+            return "time", normalized_time
+        return "text", option.casefold()
+
+    seen_options = {duplicate_key(option) for option in existing_options}
+    for option in additions_without_ng:
+        option_key = duplicate_key(option)
+        if option_key in seen_options:
+            raise ScheduleInputError(f"同じ候補は追加できません: {option}")
+        seen_options.add(option_key)
+
+    existing_without_ng = (
+        existing_options[:-1] if existing_has_ng else existing_options
+    )
+    terminal_ng = (
+        [existing_options[-1]]
+        if existing_has_ng
+        else (["NG"] if addition_ng_indexes else [])
+    )
+    merged_options = existing_without_ng + additions_without_ng + terminal_ng
+    if len(merged_options) > MAX_SCHEDULE_OPTIONS:
+        raise ScheduleInputError(f"候補は最大{MAX_SCHEDULE_OPTIONS}個です")
+
+    if not auto_start_enabled:
+        return merged_options
+
+    normalized_options = normalize_auto_start_options(merged_options)
+    if normalized_options is None:
+        raise ScheduleInputError(
+            "自動開始の投票には、重複しない時刻または末尾のNGだけを追加できます"
+        )
+    return normalized_options
+
+
 def normalize_schedule_time(value: str) -> str | None:
     """対応する時刻表記を、自動判定・通知用の HH:MM 形式へそろえる。"""
     value = value.strip()
@@ -547,6 +670,163 @@ def parse_schedule_add_options(value: str | None) -> tuple[list[str], int]:
     return options, minimum
 
 
+def schedule_target_from_entity(target: object) -> ScheduleTarget:
+    """Discordオブジェクト、特別メンション、表示名を対象へそろえる。"""
+    if isinstance(target, ScheduleTarget):
+        return target
+    if isinstance(target, str):
+        mention = target.strip()
+        if mention in SPECIAL_SCHEDULE_TARGETS:
+            return ScheduleTarget(mention[1:], mention, mention)
+        if SCHEDULE_LABEL_PATTERN.fullmatch(mention) is not None:
+            return ScheduleTarget("label", mention, mention)
+        raise ValueError("unsupported schedule target")
+
+    mention = str(getattr(target, "mention", ""))
+    is_default = getattr(target, "is_default", None)
+    if callable(is_default) and is_default():
+        return ScheduleTarget("everyone", "@everyone", "@everyone")
+    if ROLE_MENTION_PATTERN.fullmatch(mention) is not None:
+        return ScheduleTarget(
+            "role",
+            mention,
+            str(getattr(target, "name", mention)),
+            target,
+        )
+    if USER_MENTION_PATTERN.fullmatch(mention) is not None:
+        name = getattr(target, "display_name", None) or getattr(
+            target,
+            "name",
+            mention,
+        )
+        return ScheduleTarget("user", mention, str(name), target)
+    raise ValueError("unsupported schedule target")
+
+
+async def resolve_schedule_target(
+    ctx: commands.Context,
+    argument: str,
+) -> ScheduleTarget:
+    """コマンド引数を表示名・ユーザー・ロール・全体通知へ解決する。"""
+    if ctx.guild is None:
+        raise commands.NoPrivateMessage()
+
+    value = argument.strip()
+    if value in SPECIAL_SCHEDULE_TARGETS:
+        return ScheduleTarget(value[1:], value, value)
+
+    if match := ROLE_MENTION_PATTERN.fullmatch(value):
+        role = ctx.guild.get_role(int(match.group(1)))
+        if role is None:
+            raise commands.BadArgument("対象ロールが見つかりません")
+        return schedule_target_from_entity(role)
+
+    if match := USER_MENTION_PATTERN.fullmatch(value):
+        user_id = int(match.group(1))
+        member = ctx.guild.get_member(user_id)
+        if member is None:
+            mentioned_users = getattr(
+                getattr(ctx, "message", None),
+                "mentions",
+                (),
+            )
+            for mentioned in mentioned_users:
+                if (
+                    isinstance(mentioned, discord.Member)
+                    and getattr(mentioned, "id", None) == user_id
+                ):
+                    member = mentioned
+                    break
+        if member is None:
+            try:
+                member = await commands.MemberConverter().convert(ctx, value)
+            except commands.CommandError as error:
+                raise commands.BadArgument(
+                    "対象ユーザーが見つかりません"
+                ) from error
+        return schedule_target_from_entity(member)
+
+    if SCHEDULE_LABEL_PATTERN.fullmatch(value) is not None:
+        return ScheduleTarget("label", value, value)
+
+    raise commands.BadArgument(
+        "@任意名、@ユーザー、@ロール、@everyone、@here のいずれかを指定してください"
+    )
+
+
+def schedule_target_allowed_mentions(
+    target: ScheduleTarget,
+    *,
+    enabled: bool,
+) -> discord.AllowedMentions:
+    """対象だけを許可したAllowedMentionsを作る。"""
+    if not enabled:
+        return discord.AllowedMentions.none()
+    if target.kind in {"everyone", "here"}:
+        return discord.AllowedMentions(
+            everyone=True,
+            users=False,
+            roles=False,
+            replied_user=False,
+        )
+    if target.entity is None:
+        return discord.AllowedMentions.none()
+    if target.kind == "role":
+        return discord.AllowedMentions(
+            everyone=False,
+            users=False,
+            roles=[target.entity],
+            replied_user=False,
+        )
+    if target.kind == "user":
+        return discord.AllowedMentions(
+            everyone=False,
+            users=[target.entity],
+            roles=False,
+            replied_user=False,
+        )
+    return discord.AllowedMentions.none()
+
+
+def schedule_target_requires_mention_everyone(
+    target: ScheduleTarget,
+) -> bool:
+    if target.kind in {"everyone", "here"}:
+        return True
+    return (
+        target.kind == "role"
+        and target.entity is not None
+        and not getattr(target.entity, "mentionable", True)
+    )
+
+
+def schedule_target_was_mentioned(message, target: ScheduleTarget) -> bool:
+    """Prefixコマンド本文に実際の対象メンションがあったかを確認する。"""
+    if target.kind == "role":
+        return any(
+            getattr(role, "id", None) == target.id
+            for role in getattr(message, "role_mentions", ())
+        )
+    if target.kind == "user":
+        return any(
+            getattr(user, "id", None) == target.id
+            for user in getattr(message, "mentions", ())
+        )
+    if target.kind == "label":
+        content = str(getattr(message, "content", ""))
+        return re.search(
+            rf"(?:^|\s){re.escape(target.mention)}(?:\s|$)",
+            content,
+        ) is not None
+    if target.kind in {"everyone", "here"}:
+        content = str(getattr(message, "content", ""))
+        return bool(getattr(message, "mention_everyone", False)) and re.search(
+            rf"(?:^|\s){re.escape(target.mention)}(?:\s|$)",
+            content,
+        ) is not None
+    return False
+
+
 def format_schedule_options(options: list[str]) -> str:
     emojis = schedule_option_emojis(options)
     return ", ".join(
@@ -568,6 +848,21 @@ def schedule_option_emojis(options: list[str]) -> list[str]:
 def format_start_label(start_time: str) -> str:
     normalized_time = normalize_schedule_time(start_time)
     return f"{normalized_time or start_time} 開始"
+
+
+def format_start_notification(
+    start_time: str,
+    target_mention: str,
+    *,
+    previous_start_time: str | None = None,
+) -> str:
+    content = f"✅ {format_start_label(start_time)} {target_mention}"
+    if previous_start_time is not None:
+        content += (
+            f"（🔄 {format_start_label(previous_start_time)}"
+            "から変更されました）"
+        )
+    return content
 
 
 def schedule_options_from_embed(embed: discord.Embed) -> list[str] | None:
@@ -1388,7 +1683,7 @@ def choose_start_time(
 
 
 def build_schedule_embed(
-    role: discord.Role,
+    target: object,
     options: list[str],
     author,
     *,
@@ -1400,8 +1695,15 @@ def build_schedule_embed(
         and not AUTO_START_MINIMUM_MIN <= minimum <= AUTO_START_MINIMUM_MAX
     ):
         raise ValueError("auto-start minimum is out of range")
+    try:
+        target_name = schedule_target_from_entity(target).name
+    except ValueError:
+        target_name = str(
+            getattr(target, "display_name", None)
+            or getattr(target, "name", "通知対象")
+        )
     embed = discord.Embed(
-        title=f"{SCHEDULE_TITLE_PREFIX}{role.name} 開始時間",
+        title=f"{SCHEDULE_TITLE_PREFIX}{target_name} 開始時間",
         description=format_schedule_options(options),
         color=discord.Color.blue(),
     )
@@ -1680,7 +1982,7 @@ class PollCog(commands.Cog):
 
     @commands.hybrid_group(
         name="schedule",
-        description="ロールの開始時間投票を管理します",
+        description="開始時間投票を管理します",
         invoke_without_command=True,
     )
     @commands.guild_only()
@@ -1688,19 +1990,22 @@ class PollCog(commands.Cog):
         prefix = ctx.clean_prefix or "/"
         await ctx.send(
             "📅 開始時間投票コマンド\n"
-            f"作成: `{prefix}schedule add @ロール [候補...]`\n"
+            f"作成: `{prefix}schedule add <通知対象> [候補...]`\n"
+            "通知対象: `@任意名`・`@ユーザー`・`@ロール`・`@everyone`・`@here`\n"
             f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`（末尾の `[人数]` で最低人数を変更）\n"
             f"状況確認: `{prefix}schedule status [投稿IDまたはリンク]`\n"
             f"複製: `{prefix}schedule clone [投稿IDまたはリンク]`\n"
             f"開催日: `{prefix}schedule date [投稿IDまたはリンク] <日付>`\n"
             f"最低人数変更: `{prefix}schedule minimum [投稿IDまたはリンク] 3`\n"
             f"締切設定: `{prefix}schedule deadline [投稿IDまたはリンク] 2026-08-14 19:00`\n"
+            f"候補追加: `{prefix}schedule option-add [投稿IDまたはリンク] 23:00`\n"
             f"更新: `{prefix}schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`\n"
             f"確定: `{prefix}schedule decide [投稿IDまたはリンク] 21:00`\n"
             f"遅刻集計: `{prefix}schedule late [期間]`\n"
             f"遅刻判定停止: `{prefix}schedule lateoff [投稿IDまたはリンク]`\n"
             f"終了: `{prefix}schedule close [投稿IDまたはリンク]`\n"
-            f"完全削除: `{prefix}schedule delete [投稿IDまたはリンク]`"
+            f"完全削除: `{prefix}schedule delete [投稿IDまたはリンク]`",
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @schedule.error
@@ -1712,7 +2017,7 @@ class PollCog(commands.Cog):
 
     @schedule.command(name="add", description="新しい開始時間投票を作成します")
     @app_commands.describe(
-        role="開始時間調整の対象ロール",
+        target="表示する@任意名、または通知するユーザー・ロール・everyone・here",
         options=(
             f"空白区切りの候補（省略時: {DEFAULT_SCHEDULE_OPTIONS}）。"
             "末尾の [人数] で最低人数を指定"
@@ -1722,7 +2027,7 @@ class PollCog(commands.Cog):
     async def schedule_add(
         self,
         ctx: commands.Context,
-        role: discord.Role,
+        target: ScheduleTargetConverter,
         *,
         options: Optional[str] = None,
     ):
@@ -1738,36 +2043,148 @@ class PollCog(commands.Cog):
             await self._send_notice(ctx, f"❌ {error}")
             return
 
-        if role.is_default():
-            await self._send_notice(ctx, "❌ @everyone は日程調整の対象にできません")
+        try:
+            target = schedule_target_from_entity(target)
+        except ValueError:
+            await self._send_notice(
+                ctx,
+                "❌ @任意名、@ユーザー、@ロール、@everyone、@here のいずれかを指定してください",
+            )
             return
 
+        target_already_mentioned = (
+            ctx.interaction is None
+            and schedule_target_was_mentioned(ctx.message, target)
+        )
+        special_target_was_typed = (
+            ctx.interaction is None
+            and target.kind in {"everyone", "here"}
+            and re.search(
+                rf"(?:^|\s){re.escape(target.mention)}(?:\s|$)",
+                str(getattr(ctx.message, "content", "")),
+            ) is not None
+        )
         if (
             ctx.interaction is None
-            and role not in getattr(ctx.message, "role_mentions", [])
+            and not target_already_mentioned
+            and not special_target_was_typed
         ):
             await self._send_notice(
                 ctx,
-                "❌ プレフィックスコマンドでは対象ロールをメンションで指定してください",
+                "❌ プレフィックスコマンドでは通知対象をメンションで指定してください",
             )
             return
 
         await self._create_schedule_poll(
             ctx,
-            role,
+            target,
             option_list,
             minimum,
-            role_already_mentioned=ctx.interaction is None,
+            target_already_mentioned=target_already_mentioned,
         )
+
+    @schedule_add.autocomplete("target")
+    async def schedule_add_target_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        guild = interaction.guild
+        current_value = current.strip()
+        query = current_value.removeprefix("@").casefold()
+
+        def ranked_candidate(
+            name: str,
+            value: str,
+            search_terms: tuple[str, ...],
+            kind_rank: int,
+            *,
+            current_label: bool = False,
+        ) -> tuple[tuple[int, int, str], str, str] | None:
+            normalized_terms = tuple(term.casefold() for term in search_terms)
+            if current_label:
+                match_rank = -1
+            elif not query:
+                match_rank = 1
+            elif any(term == query for term in normalized_terms):
+                match_rank = -2
+            elif any(term.startswith(query) for term in normalized_terms):
+                match_rank = 1
+            elif any(query in term for term in normalized_terms):
+                match_rank = 2
+            else:
+                return None
+            return ((match_rank, kind_rank, name.casefold()), name, value)
+
+        def candidates():
+            if (
+                current_value not in SPECIAL_SCHEDULE_TARGETS
+                and SCHEDULE_LABEL_PATTERN.fullmatch(current_value) is not None
+            ):
+                candidate = ranked_candidate(
+                    f"表示のみ: {current_value}"[:100],
+                    current_value,
+                    (current_value.removeprefix("@"),),
+                    0,
+                    current_label=True,
+                )
+                if candidate is not None:
+                    yield candidate
+
+            # Discordの実際の特別メンションと同じ小文字入力のみ候補にする。
+            if not current_value or current_value.startswith("@"):
+                for special in ("@everyone", "@here"):
+                    if current_value and not special.startswith(current_value):
+                        continue
+                    candidate = ranked_candidate(
+                        special,
+                        special,
+                        (special.removeprefix("@"),),
+                        1,
+                    )
+                    if candidate is not None:
+                        yield candidate
+
+            if guild is None:
+                return
+            for role in guild.roles:
+                if role.is_default():
+                    continue
+                candidate = ranked_candidate(
+                    f"ロール: @{role.name}"[:100],
+                    role.mention,
+                    (role.name,),
+                    2,
+                )
+                if candidate is not None:
+                    yield candidate
+            for member in guild.members:
+                candidate = ranked_candidate(
+                    f"ユーザー: @{member.display_name}"[:100],
+                    member.mention,
+                    (member.display_name, member.name),
+                    3,
+                )
+                if candidate is not None:
+                    yield candidate
+
+        choices: list[app_commands.Choice[str]] = []
+        seen_values: set[str] = set()
+        for _, name, value in heapq.nsmallest(25, candidates()):
+            if value in seen_values:
+                continue
+            choices.append(app_commands.Choice(name=name, value=value))
+            seen_values.add(value)
+        return choices
 
     async def _create_schedule_poll(
         self,
         ctx: commands.Context,
-        role: discord.Role,
+        target: ScheduleTarget,
         option_list: list[str],
         minimum: int,
         *,
-        role_already_mentioned: bool,
+        target_already_mentioned: bool,
     ) -> discord.Message | None:
         auto_start_enabled = normalize_auto_start_options(option_list) is not None
         bot_member = ctx.guild.me
@@ -1796,15 +2213,15 @@ class PollCog(commands.Cog):
             )
             return None
 
-        if not role.mentionable:
+        if schedule_target_requires_mention_everyone(target):
             author_permissions = ctx.channel.permissions_for(ctx.author)
             if not author_permissions.mention_everyone:
                 await self._send_notice(
                     ctx,
-                    "❌ メンション不可のロールを指定する権限がありません",
+                    "❌ この通知対象をメンションする権限がありません",
                 )
                 return None
-            if not role_already_mentioned or auto_start_enabled:
+            if not target_already_mentioned or auto_start_enabled:
                 if not bot_permissions.mention_everyone:
                     await self._send_notice(
                         ctx,
@@ -1813,25 +2230,22 @@ class PollCog(commands.Cog):
                     return None
 
         embed = build_schedule_embed(
-            role,
+            target,
             option_list,
             ctx.author,
             auto_start=auto_start_enabled,
             minimum=minimum,
         )
-        # addのPrefixコマンドだけは、元投稿で既に通知しているため二重通知を避ける。
-        allowed_roles = False if role_already_mentioned else [role]
-        allowed_mentions = discord.AllowedMentions(
-            everyone=False,
-            users=False,
-            roles=allowed_roles,
-            replied_user=False,
+        # Prefixコマンドは元投稿で既に通知しているため二重通知を避ける。
+        allowed_mentions = schedule_target_allowed_mentions(
+            target,
+            enabled=not target_already_mentioned,
         )
 
         poll_message = None
         try:
             poll_message = await ctx.send(
-                content=role.mention,
+                content=target.mention,
                 embed=embed,
                 allowed_mentions=allowed_mentions,
             )
@@ -1868,10 +2282,10 @@ class PollCog(commands.Cog):
             )
 
         logger.info(
-            "%s created schedule poll %s for role %s with minimum %s",
+            "%s created schedule poll %s for target %s with minimum %s",
             ctx.author,
             poll_message.id,
-            role.id,
+            target.mention,
             minimum,
         )
         return poll_message
@@ -1966,25 +2380,22 @@ class PollCog(commands.Cog):
         if normalized_options is not None:
             options = normalized_options
 
-        role = self._schedule_role(source_message)
-        if role is None:
+        target = self._schedule_target(source_message)
+        if target is None or not self._schedule_target_is_available(target):
             await self._send_notice(
                 ctx,
-                "❌ 元の投票の対象ロールが削除されているため複製できません",
+                "❌ 元の投票の通知対象が見つからないため複製できません",
             )
-            return
-        if role.is_default():
-            await self._send_notice(ctx, "❌ @everyone は日程調整の対象にできません")
             return
 
         self._prune_expired_schedule_polls()
         minimum = schedule_minimum(source_embed) or AUTO_START_THRESHOLD
         cloned_message = await self._create_schedule_poll(
             ctx,
-            role,
+            target,
             options,
             minimum,
-            role_already_mentioned=False,
+            target_already_mentioned=False,
         )
         if cloned_message is not None:
             logger.info(
@@ -2416,6 +2827,230 @@ class PollCog(commands.Cog):
             deadline_at,
         )
 
+    @schedule.command(
+        name="option-add",
+        description="既存票を残したまま開始時間投票へ候補を追加します",
+    )
+    @app_commands.describe(
+        message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
+        options="追加する候補（例: 23:00 24:00）。既存票は保持されます",
+    )
+    @commands.guild_only()
+    async def schedule_option_add(
+        self,
+        ctx: commands.Context,
+        message: Optional[str] = None,
+        *,
+        options: Optional[str] = None,
+    ):
+        if not await self._validate_schedule_context(ctx):
+            return
+
+        if (
+            ctx.interaction is None
+            and message is not None
+            and not looks_like_explicit_message_reference(message)
+        ):
+            options = " ".join(
+                part
+                for part in (shlex.quote(message), options)
+                if part is not None
+            )
+            message = None
+        if options is None:
+            await self._send_notice(ctx, "❌ 追加する候補を指定してください")
+            return
+
+        try:
+            additions = parse_schedule_option_additions(options)
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        bot_permissions = ctx.channel.permissions_for(bot_member)
+        required_permissions = {
+            "メッセージ履歴を読む": bot_permissions.read_message_history,
+            "リアクションの追加": bot_permissions.add_reactions,
+            "埋め込みリンク": bot_permissions.embed_links,
+        }
+        missing_permissions = [
+            name for name, enabled in required_permissions.items() if not enabled
+        ]
+        if missing_permissions:
+            await self._send_notice(
+                ctx,
+                "❌ Botに次の権限が必要です: " + "、".join(missing_permissions),
+            )
+            return
+
+        message_id = await self._resolve_schedule_message_id(ctx, message)
+        if message_id is None:
+            return
+        await ctx.defer(ephemeral=ctx.interaction is not None)
+        lock = self._auto_start_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            await self._add_schedule_options_to_message(
+                ctx,
+                message_id,
+                additions,
+            )
+
+    async def _add_schedule_options_to_message(
+        self,
+        ctx: commands.Context,
+        message_id: int,
+        additions: list[str],
+    ) -> None:
+        bot_member = getattr(ctx.guild, "me", None)
+        if bot_member is None:
+            await self._send_notice(ctx, "❌ Botのサーバー権限を確認できませんでした")
+            return
+        poll_message = await self._fetch_editable_schedule_poll(ctx, message_id)
+        if poll_message is None:
+            return
+
+        original_embed = poll_message.embeds[0]
+        try:
+            lateness_event = self._lateness_registry.get_event(message_id)
+        except (sqlite3.Error, OSError):
+            logger.exception(
+                "failed to inspect lateness event while adding poll options %s",
+                message_id,
+            )
+            lateness_event = None
+        if lateness_event is not None and lateness_event.activated_at is not None:
+            await self._send_notice(
+                ctx,
+                "❌ VCでの遅刻判定が始まった後は候補を追加できません",
+            )
+            return
+        if is_schedule_closed(original_embed):
+            await self._send_notice(
+                ctx,
+                "❌ 終了済みの開始時間投票には候補を追加できません。cloneで新しい投票を作成してください",
+            )
+            return
+
+        existing_options = schedule_options_from_embed(original_embed)
+        if existing_options is None:
+            await self._send_notice(ctx, "❌ 投票の候補を読み取れませんでした")
+            return
+        if original_embed.description != format_schedule_options(existing_options):
+            await self._send_notice(
+                ctx,
+                "❌ この投票は旧形式のため、票を維持したまま候補を追加できません。"
+                "updateで候補を再設定してください",
+            )
+            return
+
+        auto_start_enabled = is_auto_start_schedule(original_embed)
+        try:
+            merged_options = merge_schedule_options(
+                existing_options,
+                additions,
+                auto_start_enabled=auto_start_enabled,
+            )
+        except ScheduleInputError as error:
+            await self._send_notice(ctx, f"❌ {error}")
+            return
+
+        old_emojis = set(schedule_option_emojis(existing_options))
+        added_emojis = [
+            emoji
+            for emoji in schedule_option_emojis(merged_options)
+            if emoji not in old_emojis
+        ]
+        reusable_emojis: set[str] = set()
+        conflicting_emojis: list[str] = []
+        for reaction in getattr(poll_message, "reactions", ()):
+            emoji = str(reaction.emoji)
+            if emoji not in added_emojis:
+                continue
+            if getattr(reaction, "me", False) and getattr(reaction, "count", None) == 1:
+                reusable_emojis.add(emoji)
+            else:
+                conflicting_emojis.append(emoji)
+        if conflicting_emojis:
+            await self._send_notice(
+                ctx,
+                "❌ 追加候補に使うリアクションがすでに投票外で使われています: "
+                + " ".join(conflicting_emojis)
+                + "。既存票を守るため追加を中止しました",
+            )
+            return
+
+        self._invalidate_auto_start_check(message_id)
+        added_by_command: list[str] = []
+        try:
+            for emoji in added_emojis:
+                if emoji in reusable_emojis:
+                    continue
+                await poll_message.add_reaction(emoji)
+                added_by_command.append(emoji)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "failed to add a reaction while adding schedule options %s",
+                message_id,
+            )
+            rolled_back = await self._remove_own_schedule_reactions(
+                poll_message,
+                added_by_command,
+                bot_member,
+            )
+            self._resume_auto_start_check(ctx, poll_message)
+            rollback_warning = (
+                ""
+                if rolled_back
+                else "\n⚠️ 追加途中のBotリアクションを完全には戻せませんでした"
+            )
+            await self._send_notice(
+                ctx,
+                "❌ 新しいリアクションを追加できませんでした。候補と既存票は変更していません"
+                f"{rollback_warning}",
+            )
+            return
+
+        updated_embed = original_embed.copy()
+        updated_embed.description = format_schedule_options(merged_options)
+        try:
+            await poll_message.edit(embed=updated_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("failed to add schedule poll options %s", message_id)
+            rolled_back = await self._remove_own_schedule_reactions(
+                poll_message,
+                added_by_command,
+                bot_member,
+            )
+            self._resume_auto_start_check(ctx, poll_message)
+            rollback_warning = (
+                ""
+                if rolled_back
+                else "\n⚠️ 追加したBotリアクションを完全には戻せませんでした"
+            )
+            await self._send_notice(
+                ctx,
+                "❌ 投票へ候補を追加できませんでした。候補と既存票は変更していません"
+                f"{rollback_warning}",
+            )
+            return
+
+        self._resume_auto_start_check(ctx, poll_message)
+        await self._send_notice(
+            ctx,
+            "✅ 候補を追加しました（既存の投票は保持されています）\n"
+            f"{poll_message.jump_url}",
+        )
+        logger.info(
+            "%s added %s schedule option(s) to poll %s",
+            ctx.author,
+            len(additions),
+            message_id,
+        )
+
     @schedule.command(name="update", description="既存の開始時間投票を更新します")
     @app_commands.describe(
         message="対象の投稿IDまたはリンク（省略時は同チャンネルの最新投票）",
@@ -2512,6 +3147,34 @@ class PollCog(commands.Cog):
             )
             return
 
+        auto_start_enabled = normalize_auto_start_options(option_list) is not None
+        if auto_start_enabled:
+            target = self._schedule_target(poll_message)
+            if (
+                target is None
+                or not self._schedule_target_is_available(target)
+            ):
+                await self._send_notice(
+                    ctx,
+                    "❌ 通知対象が見つからないため自動開始を有効にできません",
+                )
+                return
+            if schedule_target_requires_mention_everyone(target):
+                author_permissions = ctx.channel.permissions_for(ctx.author)
+                bot_permissions = ctx.channel.permissions_for(ctx.guild.me)
+                if not author_permissions.mention_everyone:
+                    await self._send_notice(
+                        ctx,
+                        "❌ この通知対象をメンションする権限がありません",
+                    )
+                    return
+                if not bot_permissions.mention_everyone:
+                    await self._send_notice(
+                        ctx,
+                        "❌ Botに「@everyone、@here、すべてのロールにメンション」の権限が必要です",
+                    )
+                    return
+
         self._invalidate_auto_start_check(message_id)
         active_announcement = start_announcement(original_embed)
         registered_poll = self._registered_schedule_polls.get(message_id)
@@ -2520,7 +3183,6 @@ class PollCog(commands.Cog):
             if registered_poll is not None
             else schedule_deadline_at(original_embed)
         )
-        auto_start_enabled = normalize_auto_start_options(option_list) is not None
         minimum = auto_start_minimum(original_embed) or AUTO_START_THRESHOLD
         updated_embed = original_embed.copy()
         updated_embed.description = format_schedule_options(option_list)
@@ -2544,8 +3206,8 @@ class PollCog(commands.Cog):
 
         cancellation_warning = ""
         if active_announcement is not None:
-            role = self._schedule_role(poll_message)
-            role_mention = self._schedule_role_mention(poll_message, role)
+            target = self._schedule_target(poll_message)
+            target_mention = self._schedule_target_mention(poll_message, target)
             try:
                 notification = await self._fetch_start_notification(
                     ctx.channel,
@@ -2554,7 +3216,7 @@ class PollCog(commands.Cog):
                 if notification is not None:
                     await notification.edit(
                         content=(
-                            f"~~{format_start_label(active_announcement.start_time)} {role_mention}~~\n"
+                            f"~~{format_start_label(active_announcement.start_time)} {target_mention}~~\n"
                             "↩️ 投票が更新されたため、この開始通知は取り消されました。"
                         ),
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -2567,7 +3229,7 @@ class PollCog(commands.Cog):
                 if not await self._post_public_cancellation_fallback(
                     ctx.channel,
                     active_announcement,
-                    role_mention,
+                    target_mention,
                     "投票が更新されました",
                 ):
                     cancellation_warning = (
@@ -2768,24 +3430,27 @@ class PollCog(commands.Cog):
             has_announced_start_before(original_embed)
             or message_id in self._start_notified_poll_ids
         )
-        role = self._schedule_role(poll_message)
-        if role is None and not already_notified:
+        target = self._schedule_target(poll_message)
+        if (
+            (target is None or not self._schedule_target_is_available(target))
+            and not already_notified
+        ):
             await self._send_notice(
                 ctx,
-                "❌ 対象ロールが削除されているため開始通知を送れません",
+                "❌ 通知対象が見つからないため開始通知を送れません",
             )
             return
         if (
-            role is not None
+            target is not None
             and not already_notified
-            and not getattr(role, "mentionable", True)
+            and schedule_target_requires_mention_everyone(target)
         ):
             author_permissions = ctx.channel.permissions_for(ctx.author)
             bot_permissions = ctx.channel.permissions_for(ctx.guild.me)
             if not author_permissions.mention_everyone:
                 await self._send_notice(
                     ctx,
-                    "❌ メンション不可のロールを通知する権限がありません",
+                    "❌ この通知対象をメンションする権限がありません",
                 )
                 return
             if not bot_permissions.mention_everyone:
@@ -2796,7 +3461,7 @@ class PollCog(commands.Cog):
                 return
 
         self._invalidate_auto_start_check(message_id)
-        role_mention = self._schedule_role_mention(poll_message, role)
+        target_mention = self._schedule_target_mention(poll_message, target)
         old_notification = None
         new_notification = None
         old_notification_changed = False
@@ -2814,13 +3479,13 @@ class PollCog(commands.Cog):
             if old_notification is not None and announcement is not None:
                 if reused_notification:
                     content = (
-                        f"{format_start_label(decided_start_time)} {role_mention}\n"
+                        f"{format_start_label(decided_start_time)} {target_mention}\n"
                         "✅ この時間で確定しました。"
                     )
                 else:
                     content = (
                         f"~~{format_start_label(announcement.start_time)} "
-                        f"{role_mention}~~\n"
+                        f"{target_mention}~~\n"
                         "↪️ 手動確定により、"
                         f"{format_start_label(decided_start_time)}へ変更されました。"
                     )
@@ -2836,18 +3501,16 @@ class PollCog(commands.Cog):
 
             if not reused_notification:
                 allowed_mentions = (
-                    discord.AllowedMentions.none()
-                    if already_notified
-                    else discord.AllowedMentions(
-                        everyone=False,
-                        users=False,
-                        roles=[role] if role is not None else False,
-                        replied_user=False,
+                    schedule_target_allowed_mentions(
+                        target,
+                        enabled=not already_notified,
                     )
+                    if target is not None
+                    else discord.AllowedMentions.none()
                 )
                 new_notification = await ctx.channel.send(
                     content=(
-                        f"{format_start_label(decided_start_time)} {role_mention}\n"
+                        f"{format_start_label(decided_start_time)} {target_mention}\n"
                         "✅ この時間で確定しました。"
                     ),
                     allowed_mentions=allowed_mentions,
@@ -2885,7 +3548,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
             if sent_first_ping:
                 history_embed = original_embed.copy()
@@ -3268,8 +3931,8 @@ class PollCog(commands.Cog):
 
         cancellation_warning = ""
         if active_announcement is not None:
-            role = self._schedule_role(poll_message)
-            role_mention = self._schedule_role_mention(poll_message, role)
+            target = self._schedule_target(poll_message)
+            target_mention = self._schedule_target_mention(poll_message, target)
             try:
                 notification = await self._fetch_start_notification(
                     channel,
@@ -3279,7 +3942,7 @@ class PollCog(commands.Cog):
                     await notification.edit(
                         content=(
                             f"~~{format_start_label(active_announcement.start_time)} "
-                            f"{role_mention}~~\n↩️ {cancellation_reason}"
+                            f"{target_mention}~~\n↩️ {cancellation_reason}"
                         ),
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -3291,7 +3954,7 @@ class PollCog(commands.Cog):
                 if not await self._post_public_cancellation_fallback(
                     channel,
                     active_announcement,
-                    role_mention,
+                    target_mention,
                     fallback_reason,
                 ):
                     cancellation_warning = (
@@ -5190,14 +5853,17 @@ class PollCog(commands.Cog):
                 return
             missing_current_notification = True
 
-        role = self._schedule_role(poll_message)
+        target = self._schedule_target(poll_message)
         if (
             start_time is not None
-            and role is None
+            and (
+                target is None
+                or not self._schedule_target_is_available(target)
+            )
             and not has_announced_start_before(poll_message.embeds[0])
         ):
             logger.warning(
-                "schedule poll %s has no target role",
+                "schedule poll %s has no available notification target",
                 poll_message.id,
             )
             return
@@ -5206,7 +5872,7 @@ class PollCog(commands.Cog):
             self._apply_start_time_transition(
                 channel=channel,
                 poll_message=poll_message,
-                role=role,
+                target=target,
                 new_start_time=start_time,
                 minimum=minimum,
                 guild_id=guild_id,
@@ -5240,7 +5906,7 @@ class PollCog(commands.Cog):
         *,
         channel,
         poll_message: discord.Message,
-        role: discord.Role | None,
+        target: ScheduleTarget | None,
         new_start_time: str | None,
         minimum: int,
         guild_id: int | None = None,
@@ -5258,7 +5924,7 @@ class PollCog(commands.Cog):
             if missing_current_notification
             else await self._fetch_start_notification(channel, announcement)
         )
-        role_mention = self._schedule_role_mention(poll_message, role)
+        target_mention = self._schedule_target_mention(poll_message, target)
         if poll_message.id not in self._registered_schedule_ids:
             return
 
@@ -5270,7 +5936,7 @@ class PollCog(commands.Cog):
             )
             await old_notification.edit(
                 content=(
-                    f"~~{format_start_label(announcement.start_time)} {role_mention}~~"
+                    f"~~{format_start_label(announcement.start_time)} {target_mention}~~"
                     f"{replacement}"
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -5279,7 +5945,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 return
 
@@ -5292,7 +5958,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 raise
 
@@ -5307,7 +5973,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 return
 
@@ -5327,7 +5993,7 @@ class PollCog(commands.Cog):
                     channel,
                     content=(
                         f"↩️ {format_start_label(announcement.start_time)}の通知を取り消しました "
-                        f"{role_mention}\n"
+                        f"{target_mention}\n"
                         f"{cancellation_detail}"
                     ),
                     poll_message_id=poll_message.id,
@@ -5359,7 +6025,7 @@ class PollCog(commands.Cog):
                     await self._restore_start_notification(
                         old_notification,
                         announcement,
-                        role_mention,
+                        target_mention,
                     )
                     return
             self._cancel_lateness_event(poll_message.id)
@@ -5370,21 +6036,26 @@ class PollCog(commands.Cog):
             has_announced_start_before(original_embed)
             or poll_message.id in self._start_notified_poll_ids
         )
-        if role is None and not already_notified:
+        if (
+            (target is None or not self._schedule_target_is_available(target))
+            and not already_notified
+        ):
             return
 
-        content = f"{format_start_label(new_start_time)} {role_mention}"
-        if announcement is not None and not missing_current_notification:
-            content += f"\n🔄 {format_start_label(announcement.start_time)}から変更されました。"
+        previous_start_time = (
+            announcement.start_time
+            if announcement is not None and not missing_current_notification
+            else None
+        )
+        content = format_start_notification(
+            new_start_time,
+            target_mention,
+            previous_start_time=previous_start_time,
+        )
         allowed_mentions = (
-            discord.AllowedMentions.none()
-            if already_notified
-            else discord.AllowedMentions(
-                everyone=False,
-                users=False,
-                roles=[role] if role is not None else False,
-                replied_user=False,
-            )
+            schedule_target_allowed_mentions(target, enabled=True)
+            if target is not None and not already_notified
+            else discord.AllowedMentions.none()
         )
 
         new_notification = None
@@ -5404,11 +6075,11 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 return
             if not already_notified:
-                # Discordへのrole pingは送信時点で成立する。footer確定に失敗しても
+                # Discordへの初回通知は送信時点で成立する。footer確定に失敗しても
                 # 同一プロセス内のretryでは再pingしない。
                 self._start_notified_poll_ids.add(poll_message.id)
             # footer保存中の削除eventも拾えるよう、送信直後から一時追跡する。
@@ -5441,7 +6112,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 return
             if (
@@ -5461,7 +6132,7 @@ class PollCog(commands.Cog):
                 await self._restore_start_notification(
                     old_notification,
                     announcement,
-                    role_mention,
+                    target_mention,
                 )
                 if old_notification is not None:
                     self._remember_start_notification(
@@ -5486,7 +6157,7 @@ class PollCog(commands.Cog):
             await self._restore_start_notification(
                 old_notification,
                 announcement,
-                role_mention,
+                target_mention,
             )
             if old_notification is not None:
                 self._remember_start_notification(
@@ -5576,13 +6247,13 @@ class PollCog(commands.Cog):
     async def _post_public_cancellation_fallback(
         channel,
         announcement: StartAnnouncement,
-        role_mention: str,
+        target_mention: str,
         reason: str,
     ) -> bool:
         try:
             await channel.send(
                 content=(
-                    f"↩️ ~~{format_start_label(announcement.start_time)} {role_mention}~~\n"
+                    f"↩️ ~~{format_start_label(announcement.start_time)} {target_mention}~~\n"
                     f"{reason}。以前の開始通知は無効です。"
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -5599,13 +6270,16 @@ class PollCog(commands.Cog):
     async def _restore_start_notification(
         notification,
         announcement: StartAnnouncement | None,
-        role_mention: str,
+        target_mention: str,
     ) -> None:
         if notification is None or announcement is None:
             return
         try:
             await notification.edit(
-                content=f"{format_start_label(announcement.start_time)} {role_mention}",
+                content=format_start_notification(
+                    announcement.start_time,
+                    target_mention,
+                ),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
@@ -5615,14 +6289,20 @@ class PollCog(commands.Cog):
             )
 
     @staticmethod
-    def _schedule_role_mention(
+    def _schedule_target_mention(
         poll_message: discord.Message,
-        role: discord.Role | None,
+        target: ScheduleTarget | None,
     ) -> str:
-        if role is not None:
-            return role.mention
-        match = ROLE_MENTION_PATTERN.search(poll_message.content)
-        return match.group(0) if match is not None else "対象ロール"
+        if target is not None:
+            return target.mention
+        content = str(getattr(poll_message, "content", "")).strip()
+        if content in SPECIAL_SCHEDULE_TARGETS:
+            return content
+        for pattern in (ROLE_MENTION_PATTERN, USER_MENTION_PATTERN):
+            match = pattern.search(content)
+            if match is not None:
+                return match.group(0)
+        return "通知対象"
 
     def _schedule_user_display_name(
         self,
@@ -5702,27 +6382,97 @@ class PollCog(commands.Cog):
             if reaction is None or not reaction.me:
                 await poll_message.add_reaction(emoji)
 
+    def _schedule_target(
+        self,
+        poll_message: discord.Message,
+    ) -> ScheduleTarget | None:
+        content = str(getattr(poll_message, "content", "")).strip()
+        if content in SPECIAL_SCHEDULE_TARGETS:
+            return ScheduleTarget(content[1:], content, content)
+
+        if match := ROLE_MENTION_PATTERN.search(content):
+            role_id = int(match.group(1))
+            role = next(
+                (
+                    mentioned_role
+                    for mentioned_role in getattr(
+                        poll_message,
+                        "role_mentions",
+                        (),
+                    )
+                    if getattr(mentioned_role, "id", None) == role_id
+                ),
+                None,
+            )
+            guild = getattr(poll_message, "guild", None)
+            if role is None and guild is not None:
+                get_role = getattr(guild, "get_role", None)
+                role = get_role(role_id) if callable(get_role) else None
+            return ScheduleTarget(
+                "role",
+                match.group(0),
+                str(getattr(role, "name", match.group(0))),
+                role,
+            )
+
+        if match := USER_MENTION_PATTERN.search(content):
+            user_id = int(match.group(1))
+            guild = getattr(poll_message, "guild", None)
+            get_member = getattr(guild, "get_member", None)
+            user = get_member(user_id) if callable(get_member) else None
+            if user is None:
+                mentioned_user = next(
+                    (
+                        mentioned_user
+                        for mentioned_user in getattr(
+                            poll_message,
+                            "mentions",
+                            (),
+                        )
+                        if getattr(mentioned_user, "id", None) == user_id
+                    ),
+                    None,
+                )
+                if isinstance(mentioned_user, discord.Member):
+                    user = mentioned_user
+            name = (
+                getattr(user, "display_name", None)
+                or getattr(user, "name", None)
+                or match.group(0)
+            )
+            return ScheduleTarget(
+                "user",
+                match.group(0),
+                str(name),
+                user,
+            )
+        if SCHEDULE_LABEL_PATTERN.fullmatch(content) is not None:
+            return ScheduleTarget("label", content, content)
+        return None
+
     @staticmethod
-    def _schedule_role(poll_message: discord.Message) -> discord.Role | None:
-        if poll_message.role_mentions:
-            return poll_message.role_mentions[0]
-        match = ROLE_MENTION_PATTERN.search(poll_message.content)
-        if match is None or poll_message.guild is None:
-            return None
-        return poll_message.guild.get_role(int(match.group(1)))
+    def _schedule_target_is_available(target: ScheduleTarget) -> bool:
+        return (
+            target.kind in {"label", "everyone", "here"}
+            or target.entity is not None
+        )
 
     @schedule_add.error
     async def schedule_add_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
             await self._send_notice(
                 ctx,
-                "❌ 使い方: `/schedule add @ロール [候補...]`\n"
+                "❌ 使い方: `/schedule add <通知対象> [候補...]`\n"
+                "通知対象: `@任意名`・`@ユーザー`・`@ロール`・`@everyone`・`@here`\n"
                 f"候補省略時: `{DEFAULT_SCHEDULE_OPTIONS}`\n"
                 "最低人数を変える場合は末尾に `[人数]` を指定してください",
             )
             return
         if isinstance(error, commands.BadArgument):
-            await self._send_notice(ctx, "❌ 対象ロールをメンションで指定してください")
+            await self._send_notice(
+                ctx,
+                "❌ @任意名、@ユーザー、@ロール、@everyone、@here のいずれかを指定してください",
+            )
             return
         if isinstance(error, commands.NoPrivateMessage):
             await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
@@ -5776,6 +6526,19 @@ class PollCog(commands.Cog):
             await self._send_notice(
                 ctx,
                 "❌ 使い方: `/schedule update [投稿IDまたはリンク] 21:00 22:00 24:00 NG`",
+            )
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await self._send_notice(ctx, "❌ このコマンドはサーバー内でのみ使えます")
+            return
+        raise error
+
+    @schedule_option_add.error
+    async def schedule_option_add_error(self, ctx, error):
+        if isinstance(error, commands.MissingRequiredArgument):
+            await self._send_notice(
+                ctx,
+                "❌ 使い方: `/schedule option-add [投稿IDまたはリンク] 23:00 [24:00 ...]`",
             )
             return
         if isinstance(error, commands.NoPrivateMessage):
@@ -5880,6 +6643,32 @@ class PollCog(commands.Cog):
         for emoji in schedule_option_emojis(options):
             await message.add_reaction(emoji)
 
+    @staticmethod
+    async def _remove_own_schedule_reactions(
+        message: discord.Message,
+        emojis: list[str],
+        bot_member: object,
+    ) -> bool:
+        """失敗した候補追加でBot自身が付けたリアクションだけを戻す。"""
+        if not emojis:
+            return True
+        remove_reaction = getattr(message, "remove_reaction", None)
+        if remove_reaction is None:
+            return False
+
+        removed_all = True
+        for emoji in reversed(emojis):
+            try:
+                await remove_reaction(emoji, bot_member)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                logger.exception(
+                    "failed to roll back schedule reaction %s on message %s",
+                    emoji,
+                    getattr(message, "id", "unknown"),
+                )
+                removed_all = False
+        return removed_all
+
     @classmethod
     async def _reset_schedule_reactions(
         cls,
@@ -5897,7 +6686,11 @@ class PollCog(commands.Cog):
 
     @staticmethod
     async def _send_notice(ctx: commands.Context, content: str):
-        kwargs = {"ephemeral": True} if ctx.interaction is not None else {}
+        kwargs = {
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if ctx.interaction is not None:
+            kwargs["ephemeral"] = True
         await ctx.send(content, **kwargs)
 
     @staticmethod
